@@ -55,6 +55,9 @@ class OptionsQuoteManager:
     # 選擇權鏈快取
     _chains: Dict[str, OptionsChain] = field(default_factory=dict, init=False, repr=False)
 
+    # 報價頁面編號 (群益 API 需要)
+    _page_no: int = field(default=0, init=False, repr=False)
+
     # 報價回調
     on_quote: Callable[[OptionQuote], None] | None = field(
         default=None, init=False, repr=False
@@ -225,12 +228,9 @@ class OptionsQuoteManager:
             self._chains.clear()
             logger.info("選擇權報價連線已中斷")
 
-    def get_products(self, exchange: str = "") -> bool:
+    def get_products(self) -> bool:
         """
-        取得商品清單
-
-        Args:
-            exchange: 交易所代號 (空字串=全部)
+        取得海外選擇權商品清單
 
         Returns:
             bool: 是否成功
@@ -238,9 +238,9 @@ class OptionsQuoteManager:
         if not self._connected:
             raise CapitalAPIError("請先連線到報價伺服器")
 
-        code = self._oo_quote.SKOOQuoteLib_GetProducts(exchange)
+        code = self._oo_quote.SKOOQuoteLib_RequestProducts()
         if code == 0:
-            logger.info(f"請求商品清單: {exchange or '全部'}")
+            logger.info("請求海外選擇權商品清單")
             return True
         else:
             message = self.client.get_return_message(code)
@@ -252,7 +252,7 @@ class OptionsQuoteManager:
         訂閱選擇權報價
 
         Args:
-            symbol: 商品代號 (如 "TXO22000C4" 或交易所格式)
+            symbol: 商品代號 (如海外選擇權格式)
 
         Returns:
             bool: 是否成功
@@ -260,7 +260,10 @@ class OptionsQuoteManager:
         if not self._connected:
             raise CapitalAPIError("請先連線到報價伺服器")
 
-        code = self._oo_quote.SKOOQuoteLib_RequestStocksLONG(symbol)
+        # SKOOQuoteLib_RequestStocks 需要 page 參數
+        self._page_no, code = self._oo_quote.SKOOQuoteLib_RequestStocks(
+            self._page_no, symbol
+        )
         if code == 0:
             self._subscribed.add(symbol)
             logger.info(f"訂閱選擇權報價: {symbol}")
@@ -285,7 +288,10 @@ class OptionsQuoteManager:
 
         # 用逗號分隔多檔商品
         symbols_str = ",".join(symbols)
-        code = self._oo_quote.SKOOQuoteLib_RequestStocksLONG(symbols_str)
+        # SKOOQuoteLib_RequestStocks 需要 page 參數
+        self._page_no, code = self._oo_quote.SKOOQuoteLib_RequestStocks(
+            self._page_no, symbols_str
+        )
 
         if code == 0:
             self._subscribed.update(symbols)

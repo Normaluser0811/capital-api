@@ -40,16 +40,22 @@ class TwOptionsQuoteManager:
         client.login(...)
 
         options = TwOptionsQuoteManager(client)
-        options.connect()
+        options.connect()  # 會自動請求選擇權商品清單
 
         # 訂閱選擇權
-        options.subscribe("TXO19000L4")  # TXO 19000 Call 12月
+        options.subscribe("TXO23000A6")  # TXO 23000 Call 1月 2026年
 
-    商品代碼格式:
-        TXO{履約價}{C/P}{月份}
-        - C: Call (買權) 用 A-L 代表 1-12 月
-        - P: Put (賣權) 用 M-X 代表 1-12 月
-        例如: TXO19000L4 = 19000 Call 12月第4週
+    商品代碼格式 (共10碼):
+        {商品代碼}{5位履約價}{月份代碼}{年份尾碼}
+        - 商品代碼: TXO (月選), TX1/TX2/TX4/TX5 (週三週選), TXU/TXV/TXX/TXY/TXZ (週五週選)
+        - 履約價: 5位數字 (不足補零)
+        - 月份代碼: A-L (Call 1-12月), M-X (Put 1-12月)
+        - 年份尾碼: 西元年最後一位數字
+
+        例如:
+        - TXO23000A6 = 月選 23000 Call 1月 2026年
+        - TXO23000M6 = 月選 23000 Put 1月 2026年
+        - TX423000V8 = 週選(第4週) 23000 Put 10月 2028年
     """
     client: CapitalClient
 
@@ -194,6 +200,10 @@ class TwOptionsQuoteManager:
         """
         連線到報價伺服器
 
+        Note:
+            連線後需要等待 OnConnection 事件，確認連線成功後再呼叫
+            request_stock_list() 和 get_strike_prices()
+
         Returns:
             bool: 是否成功發起連線
         """
@@ -219,6 +229,29 @@ class TwOptionsQuoteManager:
             self._subscribed.clear()
             self._chains.clear()
             logger.info("報價連線已中斷")
+
+    def request_stock_list(self, market_no: int = MARKET_OPTIONS) -> bool:
+        """
+        請求指定市場的商品清單 (必須在訂閱報價前呼叫)
+
+        Args:
+            market_no: 市場別代號 (預設 3=選擇權)
+                      0=上市, 1=上櫃, 2=期貨, 3=選擇權, 4=興櫃
+
+        Returns:
+            bool: 是否成功
+        """
+        if not self._connected:
+            raise CapitalAPIError("請先連線到報價伺服器")
+
+        code = self._quote.SKQuoteLib_RequestStockList(market_no)
+        if code == 0:
+            logger.info(f"請求市場 {market_no} 商品清單成功")
+            return True
+        else:
+            message = self.client.get_return_message(code)
+            logger.error(f"請求市場 {market_no} 商品清單失敗: {message}")
+            return False
 
     def get_strike_prices(self) -> bool:
         """

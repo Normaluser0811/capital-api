@@ -1,12 +1,12 @@
 # Capital API 待辦事項
 
-**最後更新**: 2026-01-18
+**最後更新**: 2026-01-27
 
 ---
 
 ## 進行中
 
-- [ ] 測試選擇權報價功能
+- [ ] 測試海外選擇權報價功能 (修正後)
 
 ---
 
@@ -14,8 +14,11 @@
 
 ### 高優先
 
-- [ ] 確認台灣選擇權 (TXO) 的商品代號格式
-- [ ] 整合 options-dashboard 即時報價
+- [x] 確認台灣選擇權 (TXO) 的商品代號格式 (已完成 2026-01-27)
+  - 格式: {商品代碼}{5位履約價}{月份代碼}{年份尾碼}
+  - 例: TXO23000A6 = 月選 23000 Call 1月 2026年
+- [x] 整合 options-dashboard 即時報價 (已完成 2026-01-27)
+- [x] 新增 `request_stock_list()` 方法 (已完成 2026-01-27)
 - [ ] 完善錯誤處理與重連機制
 
 ### 中優先
@@ -37,6 +40,14 @@
 
 ## 已完成
 
+### 2026-01-24
+- [x] **修正海外選擇權報價 API 函數名稱錯誤**
+  - [x] `SKOOQuoteLib_GetProducts` → `SKOOQuoteLib_RequestProducts` (取得商品清單)
+  - [x] `SKOOQuoteLib_RequestStocksLONG` → `SKOOQuoteLib_RequestStocks` (訂閱報價)
+  - [x] 新增 `_page_no` 參數支援 (群益 API 需要 page 參數)
+  - [x] 修正 `subscribe()` 和 `subscribe_many()` 函數
+
+### 先前完成
 - [x] 專案初始化
 - [x] 基本架構設計
 - [x] CapitalClient 登入模組
