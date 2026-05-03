@@ -21,9 +21,11 @@ _sk_module = None
 
 # SKCOM.dll 預設搜尋路徑
 _SKCOM_SEARCH_PATHS = [
-    # 2.13.57 版本
+    # 2.13.57 版本（D: 與 E: 兩個 drive 都試）
+    r"D:\CapitalFuturesAPI\CapitalAPI_2.13.57_PythonExample\元件\x64",
     r"E:\CapitalFuturesAPI\CapitalAPI_2.13.57_PythonExample\元件\x64",
     # 2.13.52 版本
+    r"D:\CapitalFuturesAPI\CapitalAPI_2.13.52_PythonExample\CapitalAPI_2.13.52_PythonExample\元件\x64",
     r"E:\CapitalFuturesAPI\CapitalAPI_2.13.52_PythonExample\CapitalAPI_2.13.52_PythonExample\元件\x64",
     # 常見安裝路徑
     r"C:\Program Files\Capital\SKCOM",
