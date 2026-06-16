@@ -98,6 +98,7 @@ class _SpikeState:
         self.last_quote_ts: float | None = None
         self.connect_code: int | None = None
         self.connect_events: list[tuple] = []  # [(code, socket_code, decoded_msg), ...]
+        self.last_products_ts: float | None = None  # 最後一筆 OnProducts 時戳（判下載完成）
 
 
 def _build_event_class(oo_lib, sk, client, state: _SpikeState):
@@ -109,10 +110,13 @@ def _build_event_class(oo_lib, sk, client, state: _SpikeState):
             print(f"[OnConnect] code={code} socket={socket_code} msg={msg}")
 
         def OnProducts(self, value: str):
-            # 群益會分批回傳；累積所有片段
+            # 群益會分批回傳（可能上萬筆）；累積所有片段、記錄最後時戳
             state.products.append(value)
-            preview = value if len(value) <= 120 else value[:120] + "..."
-            print(f"[OnProducts] +{len(value)} chars: {preview}")
+            state.last_products_ts = time.time()
+            n = len(state.products)
+            if n <= 3 or n % 5000 == 0:  # 避免上萬筆洗版
+                preview = value if len(value) <= 100 else value[:100] + "..."
+                print(f"[OnProducts #{n}] +{len(value)} chars: {preview}")
 
         def OnNotifyQuoteLONG(self, index: int):
             try:
@@ -282,8 +286,10 @@ def main() -> int:
                         help="訂閱後接收報價的秒數（盤中）")
     parser.add_argument("--products-only", action="store_true",
                         help="只抓商品清單後結束（建議第一次跑）")
-    parser.add_argument("--products-wait", type=int, default=12,
-                        help="等待 OnProducts 的秒數")
+    parser.add_argument("--products-wait", type=int, default=60,
+                        help="等待商品下載完成的最長秒數（上限）")
+    parser.add_argument("--products-idle", type=int, default=4,
+                        help="OnProducts 停止幾秒視為下載完成（idle 門檻）")
     parser.add_argument("--connect-wait", type=int, default=15,
                         help="輪詢 IsConnected 等連線就緒的最長秒數")
     args = parser.parse_args()
@@ -336,16 +342,34 @@ def main() -> int:
         print("📋 請求商品清單（RequestProducts）…")
         rc = oo_lib.SKOOQuoteLib_RequestProducts()
         print(f"   RequestProducts rc={rc}")
-        pump(args.products_wait)
-        if not state.products:
-            print("   ⚠️  未收到 OnProducts（連線未就緒或等待不足；可加大 --products-wait）。")
+        # 官方文件：商品未下載完成就 RequestStocks → 3023 商品代碼無效。
+        # 用 idle 偵測等「下載完成」：OnProducts 停 args.products_idle 秒、或達 args.products_wait 上限。
+        start = time.time()
+        while True:
+            pump(1.0)
+            now = time.time()
+            idle = now - (state.last_products_ts or start)
+            if state.products and idle >= args.products_idle:
+                break
+            if now - start >= args.products_wait:
+                print(f"   ⏱️  達商品等待上限 {args.products_wait}s（可能尚未下載完，加大 --products-wait）")
+                break
+        joined = "".join(state.products)
+        print(f"   商品檔接收：{len(state.products)} 片段、約 {len(joined):,} chars"
+              + ("" if state.products else "（⚠️ 空：連線未就緒？）"))
 
         if not args.products_only and args.symbols.strip():
             symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
-            print(f"📈 訂閱 {len(symbols)} 檔：{symbols}")
-            page = 0
+            missing = [s for s in symbols if s not in joined]
+            if missing:
+                print(f"   ⚠️  下列代號不在商品檔內（恐打錯/該所未下載完）：{missing}")
+            print(f"📈 訂閱 {len(symbols)} 檔（psPageNo=1）：{symbols}")
+            page = 1  # 官方文件：psPageNo 請固定帶 1（帶 0 會訂閱失敗）
             page, rc = oo_lib.SKOOQuoteLib_RequestStocks(page, ",".join(symbols))
-            print(f"   RequestStocks rc={rc} page={page}")
+            rc_msg = client.get_return_message(rc)
+            print(f"   RequestStocks rc={rc}（{rc_msg}） page={page}")
+            if rc != 0:
+                print("   ⚠️  訂閱未成功：3023=商品代碼無效（多半商品檔未下載完或代號錯）。")
             print(f"⏳ 接收報價 {args.seconds}s …")
             pump(args.seconds)
         elif not args.products_only:

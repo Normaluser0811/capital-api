@@ -31,8 +31,11 @@
   - 🔴 **theta 正解 = `r·Price − decay`**（計畫稿/Phase 4 Excel 的 `−r·Call` 是錯的）。
   - 🔴 已修：IV bisection 端點 bug（σ 落下界回 5.0）、錯誤價格錨點（7.576083→7.5770821301）。
   - 對抗式複核（6 agent）確認 price/parity/delta/gamma/vega/theta/rho 全對。
-- **Phase 0 — `scripts/spike_overseas_options.py`**：dump SKFOREIGNLONG 全原生欄位 + 商品清單 + 更新頻率。
-  已對照官方 `D:\CapitalFuturesAPI\...\OOQuote\OOQuote.py` 驗證 COM 呼叫正確；確認結構只有 `nTradingDay`（無到期欄→LTD 須另推）。
+- **Phase 0 — `scripts/spike_overseas_options.py`**：盤中已跑、抓到 **59,768 檔商品清單**（7 交易所）。
+  - ✅ **symbol 格式破解**：`{ROOT}{履約價5碼}{月碼A-L Call/M-X Put}{年末碼}`（同 TXO 月碼）。詳見 `docs/symbol_format_spec.md`。
+  - ✅ **到期日來自商品檔第 5 欄**（YYYYMMDD）→ 最高風險「到期日解析」解決（報價結構無到期欄、只有 nTradingDay）。
+  - ✅ **修 3023 訂閱失敗根因**：`psPageNo 必須帶 1`（官方文件，原帶 0）+ 商品需下載完成才能 RequestStocks（spike 已加 idle 偵測）。
+  - ⏳ **剩：報價欄位實測**——盤中跑近 ATM 候選（`docs/symbol_format_spec.md §6`，如 `C00448G6` 玉米），確認 sDecimal/nDenominator/strike/bid/ask + 訂閱上限。
 
 ## ▶️ 下一步（依賴排序）
 
