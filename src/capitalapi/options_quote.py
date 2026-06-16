@@ -20,6 +20,60 @@ from .skcom import create_oo_quote_lib, get_sk_module
 logger = logging.getLogger(__name__)
 
 
+def build_option_quote(stock) -> OptionQuote:
+    """從 SKFOREIGNLONG 結構建 OptionQuote（純函式、可單測、不碰 COM）。
+
+    `raw_*` 欄存原始整數（忠實 raw 層、不可變鐵律）；解碼便利值 = raw / 10^decimal_places，
+    `strike` 不除（已是最終單位、與解碼後報價同單位）。
+
+    三個解碼正確性要點（修自舊版 inline bug）：
+    - `sDecimal` 可為 0（HSI/JNI divisor=1），不可硬塞 2。
+    - 履約價 `nStrikePrice` 不除 divisor。
+    - 保留 `nDenominator`（美債 32 分數制可能 != 1）。
+    """
+    decimal = int(stock.sDecimal) if stock.sDecimal >= 0 else 0
+    divisor = 10 ** decimal
+
+    call_put = str(stock.bstrCallPut).upper()
+    option_type = OptionType.CALL if call_put == "C" else OptionType.PUT
+
+    return OptionQuote(
+        symbol=stock.bstrStockNo,
+        name=stock.bstrStockName,
+        option_type=option_type,
+        strike_price=float(stock.nStrikePrice),
+        decimal_places=decimal,
+        denominator=int(stock.nDenominator),
+        # 價格（解碼後便利值；忠實 raw 整數見 raw_* 欄）
+        close_price=stock.nClose / divisor,
+        open_price=stock.nOpen / divisor,
+        high_price=stock.nHigh / divisor,
+        low_price=stock.nLow / divisor,
+        ref_price=stock.nRef / divisor,
+        settle_price=stock.nSettlePrice / divisor,
+        bid_price=stock.nBid / divisor,
+        bid_qty=stock.nBc,
+        ask_price=stock.nAsk / divisor,
+        ask_qty=stock.nAc,
+        volume=stock.nTQty,
+        tick_qty=stock.nTickQty,
+        market_no=stock.bstrMarketNo,
+        exchange_no=stock.bstrExchangeNo,
+        exchange_name=stock.bstrExchangeName,
+        trading_day=stock.nTradingDay,
+        # 原始整數（供 raw 層忠實入庫，免受解碼影響）
+        raw_open=int(stock.nOpen),
+        raw_high=int(stock.nHigh),
+        raw_low=int(stock.nLow),
+        raw_close=int(stock.nClose),
+        raw_settle=int(stock.nSettlePrice),
+        raw_ref=int(stock.nRef),
+        raw_bid=int(stock.nBid),
+        raw_ask=int(stock.nAsk),
+        raw_strike=int(stock.nStrikePrice),
+    )
+
+
 @dataclass
 class OptionsQuoteManager:
     """
@@ -104,41 +158,7 @@ class OptionsQuoteManager:
                         index, stock
                     )
 
-                    # 解析小數位數
-                    decimal = stock.sDecimal if stock.sDecimal > 0 else 2
-                    divisor = 10 ** decimal
-
-                    # 判斷 Call/Put
-                    call_put = str(stock.bstrCallPut).upper()
-                    option_type = OptionType.CALL if call_put == "C" else OptionType.PUT
-
-                    quote = OptionQuote(
-                        symbol=stock.bstrStockNo,
-                        name=stock.bstrStockName,
-                        option_type=option_type,
-                        strike_price=stock.nStrikePrice / divisor,
-                        decimal_places=decimal,
-                        # 價格
-                        close_price=stock.nClose / divisor,
-                        open_price=stock.nOpen / divisor,
-                        high_price=stock.nHigh / divisor,
-                        low_price=stock.nLow / divisor,
-                        ref_price=stock.nRef / divisor,
-                        settle_price=stock.nSettlePrice / divisor,
-                        # 買賣報價
-                        bid_price=stock.nBid / divisor,
-                        bid_qty=stock.nBc,
-                        ask_price=stock.nAsk / divisor,
-                        ask_qty=stock.nAc,
-                        # 成交
-                        volume=stock.nTQty,
-                        tick_qty=stock.nTickQty,
-                        # 交易所資訊
-                        market_no=stock.bstrMarketNo,
-                        exchange_no=stock.bstrExchangeNo,
-                        exchange_name=stock.bstrExchangeName,
-                        trading_day=stock.nTradingDay,
-                    )
+                    quote = build_option_quote(stock)
 
                     # 更新選擇權鏈快取
                     manager._update_chain(quote)
@@ -286,8 +306,8 @@ class OptionsQuoteManager:
         if not self._connected:
             raise CapitalAPIError("請先連線到報價伺服器")
 
-        # 用逗號分隔多檔商品
-        symbols_str = ",".join(symbols)
+        # 多檔以 "#" 區隔（每檔須為「交易所,代碼」；逗號併接會得 3023 商品代碼無效）
+        symbols_str = "#".join(symbols)
         # SKOOQuoteLib_RequestStocks 需要 page 參數
         self._page_no, code = self._oo_quote.SKOOQuoteLib_RequestStocks(
             self._page_no, symbols_str
