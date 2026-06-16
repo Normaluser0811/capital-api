@@ -109,8 +109,8 @@ class OptionsQuoteManager:
     # 選擇權鏈快取
     _chains: Dict[str, OptionsChain] = field(default_factory=dict, init=False, repr=False)
 
-    # 報價頁面編號 (群益 API 需要)
-    _page_no: int = field(default=0, init=False, repr=False)
+    # 報價頁面編號（群益 API：psPageNo 官方固定帶 1；page 0 不推送報價）
+    _page_no: int = field(default=1, init=False, repr=False)
 
     # 報價回調
     on_quote: Callable[[OptionQuote], None] | None = field(
@@ -169,36 +169,30 @@ class OptionsQuoteManager:
                 except Exception as e:
                     logger.error(f"處理選擇權報價時發生錯誤: {e}")
 
-            def OnNotifyTicksLONG(self, index, ptr, date, time, close, qty):
-                """逐筆成交回調"""
-                # 可以擴充處理逐筆成交
+            def OnNotifyTicksLONG(self, *args):
+                """逐筆成交回調。
+
+                ⚠ 必須用 *args：固定參數簽章會破壞 comtypes 對 SK 事件介面的
+                vtable 事件接收器建構，導致其後的事件（OnNotifyQuoteLONG）靜默不觸發
+                （OnConnect/OnProducts 在前面 slot 仍會收到，故症狀為「有商品清單、無報價」）。
+                """
                 pass
 
-            def OnNotifyBest5LONG(
-                self, index,
-                bid1, bidq1, bid2, bidq2, bid3, bidq3, bid4, bidq4, bid5, bidq5,
-                ask1, askq1, ask2, askq2, ask3, askq3, ask4, askq4, ask5, askq5
-            ):
-                """五檔報價回調"""
+            def OnNotifyBest5LONG(self, *args):
+                """五檔報價回調（*args；index 為首參，其後 10 對 bid/qty + 10 對 ask/qty）。"""
+                if not manager.on_best5:
+                    return
                 try:
-                    best5 = {
-                        "bids": [
-                            (bid1/100, bidq1), (bid2/100, bidq2), (bid3/100, bidq3),
-                            (bid4/100, bidq4), (bid5/100, bidq5)
-                        ],
-                        "asks": [
-                            (ask1/100, askq1), (ask2/100, askq2), (ask3/100, askq3),
-                            (ask4/100, askq4), (ask5/100, askq5)
-                        ]
-                    }
-                    if manager.on_best5:
-                        manager.on_best5(str(index), best5)
-                except Exception as e:
+                    idx = args[0]
+                    nums = args[1:21]
+                    bids = [(nums[i] / 100, nums[i + 1]) for i in range(0, 10, 2)]
+                    asks = [(nums[i] / 100, nums[i + 1]) for i in range(10, 20, 2)]
+                    manager.on_best5(str(idx), {"bids": bids, "asks": asks})
+                except Exception as e:  # noqa: BLE001
                     logger.error(f"處理五檔報價時發生錯誤: {e}")
 
             def OnNotifyBest10LONG(self, *args):
                 """十檔報價回調"""
-                # 可以擴充處理十檔報價
                 pass
 
         self._oo_quote_event = OOQuoteLibEvent()
@@ -280,10 +274,8 @@ class OptionsQuoteManager:
         if not self._connected:
             raise CapitalAPIError("請先連線到報價伺服器")
 
-        # SKOOQuoteLib_RequestStocks 需要 page 參數
-        self._page_no, code = self._oo_quote.SKOOQuoteLib_RequestStocks(
-            self._page_no, symbol
-        )
+        # 官方文件：psPageNo「固定帶 1」（page 0 rc=0 但不推送報價）
+        self._page_no, code = self._oo_quote.SKOOQuoteLib_RequestStocks(1, symbol)
         if code == 0:
             self._subscribed.add(symbol)
             logger.info(f"訂閱選擇權報價: {symbol}")
@@ -308,10 +300,8 @@ class OptionsQuoteManager:
 
         # 多檔以 "#" 區隔（每檔須為「交易所,代碼」；逗號併接會得 3023 商品代碼無效）
         symbols_str = "#".join(symbols)
-        # SKOOQuoteLib_RequestStocks 需要 page 參數
-        self._page_no, code = self._oo_quote.SKOOQuoteLib_RequestStocks(
-            self._page_no, symbols_str
-        )
+        # 官方文件：psPageNo「固定帶 1」。page 0 會 rc=0 但**不推送報價**（OnNotifyQuoteLONG 不觸發）。
+        self._page_no, code = self._oo_quote.SKOOQuoteLib_RequestStocks(1, symbols_str)
 
         if code == 0:
             self._subscribed.update(symbols)
