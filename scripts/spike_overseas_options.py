@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import sys
 import time
 from collections import OrderedDict
@@ -359,19 +360,37 @@ def main() -> int:
               + ("" if state.products else "（⚠️ 空：連線未就緒？）"))
 
         if not args.products_only and args.symbols.strip():
+            # 用 --symbols 接受裸商品代碼（逗號分隔，方便人輸入）；
+            # 官方 RequestStocks 需「交易所,代碼」為單位、多筆以 # 區隔 → 自動補交易所。
             symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
-            missing = [s for s in symbols if s not in joined]
+            code2exch: dict[str, str] = {}
+            for mexch, mcode, _mdate in re.findall(
+                r"([A-Za-z]{2,6}),[^,]*,([0-9A-Za-z]+),[^,]*,(\d{8})", joined):
+                code2exch.setdefault(mcode, mexch)
+            items, missing = [], []
+            for s in symbols:
+                if "," in s:            # 已含交易所（CBOT,XXX）
+                    items.append(s)
+                elif s in code2exch:
+                    items.append(f"{code2exch[s]},{s}")
+                else:
+                    missing.append(s)
             if missing:
-                print(f"   ⚠️  下列代號不在商品檔內（恐打錯/該所未下載完）：{missing}")
-            print(f"📈 訂閱 {len(symbols)} 檔（psPageNo=1）：{symbols}")
-            page = 1  # 官方文件：psPageNo 請固定帶 1（帶 0 會訂閱失敗）
-            page, rc = oo_lib.SKOOQuoteLib_RequestStocks(page, ",".join(symbols))
-            rc_msg = client.get_return_message(rc)
-            print(f"   RequestStocks rc={rc}（{rc_msg}） page={page}")
-            if rc != 0:
-                print("   ⚠️  訂閱未成功：3023=商品代碼無效（多半商品檔未下載完或代號錯）。")
-            print(f"⏳ 接收報價 {args.seconds}s …")
-            pump(args.seconds)
+                print(f"   ⚠️  下列代號不在商品檔內、略過：{missing}")
+            if not items:
+                print("   ✗ 無有效訂閱代碼。")
+            else:
+                nos = "#".join(items)   # 官方格式：交易所,代碼#交易所,代碼…
+                print(f"📈 訂閱 {len(items)} 檔（psPageNo=1）：{items}")
+                page = 1                # 官方文件：psPageNo 請固定帶 1
+                page, rc = oo_lib.SKOOQuoteLib_RequestStocks(page, nos)
+                rc_msg = client.get_return_message(rc)
+                print(f"   RequestStocks rc={rc}（{rc_msg}） page={page}")
+                if rc != 0:
+                    print("   ⚠️  訂閱未成功：3023=商品代碼無效（確認格式『交易所,代碼』）。")
+                print(f"⏳ 接收報價 {args.seconds}s …")
+                pump(args.seconds)
+                print(f"   收到報價的 symbol 數：{len(state.quote_samples)}")
         elif not args.products_only:
             print("ℹ️  未給 --symbols，僅抓商品清單。看完 §1 後用 --symbols 再跑一次。")
 

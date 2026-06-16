@@ -34,17 +34,14 @@
 - **Phase 0 — `scripts/spike_overseas_options.py`**：盤中已跑、抓到 **59,768 檔商品清單**（7 交易所）。
   - ✅ **symbol 格式破解**：`{ROOT}{履約價5碼}{月碼A-L Call/M-X Put}{年末碼}`（同 TXO 月碼）。詳見 `docs/symbol_format_spec.md`。
   - ✅ **到期日來自商品檔第 5 欄**（YYYYMMDD）→ 最高風險「到期日解析」解決（報價結構無到期欄、只有 nTradingDay）。
-  - ✅ **修 3023 訂閱失敗根因**：`psPageNo 必須帶 1`（官方文件，原帶 0）+ 商品需下載完成才能 RequestStocks（spike 已加 idle 偵測）。
-  - ⏳ **剩：報價欄位實測**——盤中跑近 ATM 候選（`docs/symbol_format_spec.md §6`，如 `C00448G6` 玉米），確認 sDecimal/nDenominator/strike/bid/ask + 訂閱上限。
+  - ✅ **訂閱格式（3023 真因）**：`RequestStocks` 的 `bstrStockNos` 須「**交易所,代碼**」為單位、多筆以 **`#`** 區隔（非逗號）+ `psPageNo=1` + 商品下載完成。spike 已自動 code→exchange 補前綴。
+  - ✅ **報價欄位實測完成（11 檔跨 6 所、rc=0）**：23 欄 layout、`價格=raw/10^sDecimal`（逐商品不同：CBOT 3/CME 2/GC·DAX 1/HSI·JNI 0）、`strike=nStrikePrice`、nDenominator=1；F 可由同履約價 put-call parity 反推（玉米驗 F≈$4.15）。**Phase 0 全 PASS**，詳見 `docs/symbol_format_spec.md`。
 
 ## ▶️ 下一步（依賴排序）
 
-1. **跑 Phase 0 spike（解鎖一切，未 PASS 不進 Phase 2+）**：
-   - 先 `cd D:\PythonProjects\capital-api; .\.venv\Scripts\python.exe -m pip install pywin32`（spike 偏好 pythoncom，否則退 comtypes）。
-   - `…\python.exe scripts/spike_overseas_options.py --products-only`（先看商品清單、挑流動性好標的）。
-   - `…\python.exe scripts/spike_overseas_options.py --symbols "<挑的鏈>" --seconds 60`（盤中，dump 原生欄位）。
-   - 依 `docs/overseas_options_field_survey.md` 填 `docs/symbol_format_spec.md`（symbol 拆解 / 到期日來源 / 標的期貨 / 訂閱上限）。
-2. **Phase 2 — postgresql-db**（先 `/db-backup` schema `raw_quotes,ods_quotes`）：2 raw + 1 ods 表手寫 migration
+1. ✅ **Phase 0 PASS（2026-06-16）** — symbol 格式 / 到期日 / 訂閱格式 / 報價欄位 + divisor 全確認，見 `docs/symbol_format_spec.md`。
+   重跑驗證：`.\.venv\Scripts\python.exe scripts/spike_overseas_options.py --symbols "C00448G6,C00448S6,GC04455G6,ES07000F6" --seconds 60`（盤中、自動補交易所前綴）。
+2. **Phase 2 — postgresql-db（現可開工）**（先 `/db-backup` schema `raw_quotes,ods_quotes`）：2 raw + 1 ods 表手寫 migration
    （`down_revision="m4rgnxref01"`、hypertable+compress）、ORM `overseas_option.py`、雙重 export。
 3. **Phase 3 — macrodata `agencies/capital/`**（**非 capital-api**）：`import capitalapi`（OptionsQuoteManager + pricing）
    + `db`，寫 collector daemon（pump 主執行緒 + DB flush worker + queue + 斷線重連）+ ods_builder（算 IV）+ CLI。
