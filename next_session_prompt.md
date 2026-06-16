@@ -1,6 +1,6 @@
 # 交接：群益海外選擇權 → PostgreSQL → Excel (Black-76 + Greeks)
 
-> **狀態（2026-06-16）**：**Phase 0 + Phase 1 完成並 push**。下一步 = **Phase 2（postgresql-db migration）**，本檔已備好可直接開工的具體 schema。
+> **狀態（2026-06-16）**：**Phase 0 + Phase 1 + Phase 2 完成**（Phase 2 migration `oseaopt01` 已套用 live macrodata DB、ORM round-trip 驗證綠、4-lens 對抗式複核 0 blocker）。下一步 = **Phase 3（macrodata `agencies/capital/` 串流 collector + ods_builder 算 IV + cli）**。
 
 ## 0. 先讀
 - 完整計畫（單一真相，頂部有架構決議）：`C:\Users\Essen\.claude\plans\capital-api-claude-md-postgresql-db-mac-unified-dongarra.md`
@@ -15,11 +15,19 @@
 | Repo | 路徑 | 分支 | 狀態 |
 |---|---|---|---|
 | capital-api | `D:\PythonProjects\capital-api` | `feat/overseas-options-ingestion` | HEAD `08e0e0e`，**已 push**（pricing+spike+tests+docs）|
-| postgresql-db | `d:\PythonProjects\postgresql-db` | `feat/margin-ingestion` | alembic head=`m4rgnxref01`（Phase 2 `down_revision` 接這）|
+| postgresql-db | `d:\PythonProjects\postgresql-db` | `feat/margin-ingestion` | **alembic head=`oseaopt01`（Phase 2 已套用 live macrodata DB；migration+model+exports 未 commit）** |
 | macrodata | `d:\PythonProjects\macrodata` | — | 已有 `agencies/capital/`；Phase 3 落這 |
 | excel-builder | `d:\PythonProjects\excel-builder` | — | 無 remote |
 
 ## 3. ✅ 已完成
+- **Phase 2 postgresql-db migration + ORM（2026-06-16，已套用 live macrodata DB、未 commit）**：
+  - migration `oseaopt01`（`migrations/versions/20260616_1200_oseaopt01_create_overseas_options_quotes.py`，`down_revision="m4rgnxref01"`）建 **2 表**：
+    - `raw_quotes.overseas_option_quote_snapshot`（24 欄、PK `(symbol, snapshot_ts)`、原始整數 BIGINT 報價 + `decimal_places`/`denominator`、parser 衍生 `root_symbol`/`option_type`/`strike`、2 index、hypertable chunk 1d + compress segmentby symbol + policy 7d、24/24 中文 COMMENT）。
+    - `ods_quotes.overseas_option_iv`（14 欄、PK `(symbol, snapshot_ts)`、`expiry_date`/`tau_years`/`underlying_price`/`option_mid`/`risk_free_rate`/`implied_vol`/`iv_status`、1 index、hypertable 1d + compress + policy 30d、14/14 COMMENT）。
+  - ORM `src/db/models/overseas_option.py`（`OverseasOptionQuoteSnapshot` + `OverseasOptionIV`），雙重 export（`models/__init__.py` + `db/__init__.py` + `__all__`）。
+  - **決策定案**：A=raw 存原始整數 + decimal_places/denominator（raw 禁值計算）；B=F 走 put-call parity、**不建 4b 期貨表**（之後純加法可補）。
+  - **驗證**：`alembic current`=oseaopt01；2 表皆 hypertable（7d/30d 壓縮）；ORM insert/read/delete round-trip 綠；4-lens 對抗式複核 0 blocker/0 major（symbol VARCHAR(16) 已對全 59,769 商品檔驗證最長 11 字、不會 overflow）。
+  - **⚠ 未 commit**（user 未要求）。pgdb 分支 `feat/margin-ingestion`。
 - **Phase 1 `src/capitalapi/pricing.py`**（純 math、37 測試全綠）：Black-76 理論價 + delta/gamma/vega/theta/rho + Newton/bisection IV。
   - theta 正解 `θ = r·Price − decay`（計畫稿/Phase 4 Excel 的 `−r·Call` 是錯的，須改 `+ r*Call`）。
   - 對抗式複核（6 agent）+ 修 IV bisection 端點 bug + 修錯誤價格錨點。
@@ -29,9 +37,9 @@
   - **報價 SKFOREIGNLONG 23 欄**；`價格 = raw / 10^sDecimal`（逐商品不同、**不可寫死**）；`strike = nStrikePrice`（不除）；`nDenominator=1`（美債 32 分數制可能≠1）。
   - **F** 可由同履約價 put-call parity 反推（`F = K + (C−P)·e^{rT}`，玉米驗 ≈$4.15）。
 
-## 4. ▶️ Phase 2 — postgresql-db（現可開工）
+## 4. ✅ Phase 2 — postgresql-db（完成 2026-06-16，以下為實作規格／已落地）
 
-> **先 `/db-backup`**（schema-scoped `raw_quotes,ods_quotes`，落 D/E NVMe）→ 手寫 migration（autogenerate 不可用）→ `alembic upgrade head` → `alembic current` 驗。`down_revision="m4rgnxref01"`、version table `alembic_version_pgdb`。
+> **執行紀錄**：備份閘判定＝此 migration 為純加法 CREATE-only（只建兩張全新空表、不碰既有 ~20GB raw_quotes 1-min bars 與 ~18GB ods_quotes continuous_bars → 既有資料零風險），`guard_db_backup` 已由 0.9h 內既有備份滿足、downgrade() 可乾淨回滾 → 未另做 38GB hypertable 全量 dump。手寫 migration（autogenerate 結構性不可用）→ `alembic upgrade head` 套用成功 → `alembic current`=`oseaopt01`。version table `alembic_version_pgdb`。
 
 **取樣式串流**：daemon 記憶體保留每 symbol 最新報價，每 N 秒對有更新者各 flush 一列；PK 含 `snapshot_ts`（我方擷取時戳、台北 naive、`timezone=False`）。
 
