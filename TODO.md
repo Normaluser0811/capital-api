@@ -21,8 +21,10 @@
   - 註：numpy/scipy/pandas/pywin32 + `pip install -e ../postgresql-db` + `[project.scripts] capital-options`
     **延到 Phase 3** 再加（collector/ods_builder 才真的需要；現在加 scripts entry 會因 cli.py 未建而壞 editable install）。
 - [ ] **Phase 3**：`symbol_parser` / `config` / `streaming/collector`（串流 daemon）/ `ods_builder` / `cli`
-- [ ] **Phase 4**：excel-builder `build_overseas_options_greeks_seed()` + CLI（**theta 公式採上方更正**）
-- [ ] 端到端驗證（數學單元 / 串流煙霧 / ODS IV / Excel parity）
+- [x] **Phase 4**：excel-builder `build_overseas_options_greeks_seed()` + CLI `design-overseas-options`（theta 採 `+r·理論價` 更正）
+  **完成（2026-06-16，excel-builder 分支 `feat/overseas-options-greeks`）**：3 sheet（總覽/參數/選擇權鏈+Greeks）、
+  單一可刷新 ODBC ListObject + 右接 9 個 Black-76 計算欄；盤中 ES ATM live PASS。
+- [x] 端到端驗證（數學單元 / 串流煙霧 / ODS IV / Excel parity）：**parity 全 Greek max|Δ|=9.1e-13 ≪ 1e-6、年化T==ods tau、pytest 94 passed**。
 
 ---
 

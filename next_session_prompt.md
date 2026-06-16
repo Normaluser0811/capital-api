@@ -1,8 +1,17 @@
 # 交接：群益海外選擇權 → PostgreSQL → Excel (Black-76 + Greeks)
 
-> **狀態（2026-06-16）**：**Phase 0–3 完成 + live 煙霧 PASS + 架構一致性審查通過** ✅。盤中端到端：`stream`→raw 185 列、`build-ods`→ods IV 76 ok（parity F ES 7557.82/DAX 24978 + Black-76 IV + 同履約價 C/P IV 一致）。🔴 串流必需 pywin32（已修，collector 硬性要求）。**架構一致**：raw 對標 `foreign_futures_bar_1m`、ods 對標 `continuous_bars`(Python 物化表)、cli 對標 capital standalone；`db.read_dataset("ods_quotes","overseas_option_iv")` 可直接消費（excel-builder 就緒）。**測試資料已 TRUNCATE 清空**（兩表 0 列、結構保留）。
+> **狀態（2026-06-16）**：**Phase 0–4 全完成 + live 端到端 PASS（parity 9.1e-13）** ✅。盤中端到端：`stream`→raw 185 列、`build-ods`→ods IV 76 ok（parity F ES 7557.82/DAX 24978 + Black-76 IV + 同履約價 C/P IV 一致）。🔴 串流必需 pywin32（已修，collector 硬性要求）。**架構一致**：raw 對標 `foreign_futures_bar_1m`、ods 對標 `continuous_bars`(Python 物化表)、cli 對標 capital standalone；`db.read_dataset("ods_quotes","overseas_option_iv")` 可直接消費（excel-builder 就緒）。**測試資料已 TRUNCATE 清空**（兩表 0 列、結構保留）。
 >
-> **🟢 下一個 session 主任務 = Phase 4 excel-builder（見 §6）**。副任務：① collector 斷線重連（MVP 未實作）② macrodata `feat/overseas-options-agency` cherry-pick 進 main（避 superset/EIA WIP）。
+> **✅ Phase 4 excel-builder 已完成（2026-06-16 盤中 live PASS、未 commit）**：excel-builder 分支 `feat/overseas-options-greeks`
+> 新增 `build_overseas_options_greeks_seed()` + CLI `design-overseas-options`（3 sheet：總覽/參數/選擇權鏈+Greeks；單一可刷新
+> ODBC ListObject + 右接 9 個 Black-76 計算欄；σ=ods IV、F=ods 標的價、r/T 取『參數』→ 改一格全表重算）。盤中 ES ATM 30 檔
+> → raw 1337 → ods IV 1320 全 ok → seed 開檔零修復/Refresh 存活/**parity 全 Greek max|Δ|=9.1e-13 ≪ 1e-6**/年化T==ods tau；
+> pytest 94 passed。🔴 坑＝pywin32 把 naive datetime 當本地時區轉 UTC（估價日偏移）→ 改 `=DATE()` 公式。產出
+> `excel-builder/templates/小型 S&P 500ES_海外選擇權Greeks_seed.xlsx`。**🟢 Phase 0–4 全完成。**
+>
+> **🟢 剩下副任務**：① collector 斷線重連（MVP 未實作）② macrodata `feat/overseas-options-agency` cherry-pick 進 main
+> （避 superset/EIA WIP）③ 多 root（DAX/穀物 C）/ 美債 32 分數制 ODS 解碼分支 ④ 4 repo commit/PR 待 user 拍板
+> （pgdb Phase 2 已 commit `b86701e`；capital-api/macrodata 已 push；excel-builder Phase 4 已 commit 於 `feat/overseas-options-greeks`、未 push）。
 
 ## 0. 先讀
 - 完整計畫（單一真相，頂部有架構決議）：`C:\Users\Essen\.claude\plans\capital-api-claude-md-postgresql-db-mac-unified-dongarra.md`
