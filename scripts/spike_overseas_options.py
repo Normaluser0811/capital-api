@@ -97,6 +97,7 @@ class _SpikeState:
         self.first_quote_ts: float | None = None
         self.last_quote_ts: float | None = None
         self.connect_code: int | None = None
+        self.connect_events: list[tuple] = []  # [(code, socket_code, decoded_msg), ...]
 
 
 def _build_event_class(oo_lib, sk, client, state: _SpikeState):
@@ -104,6 +105,7 @@ def _build_event_class(oo_lib, sk, client, state: _SpikeState):
         def OnConnect(self, code: int, socket_code: int):
             state.connect_code = code
             msg = client.get_return_message(code)
+            state.connect_events.append((int(code), int(socket_code), msg))
             print(f"[OnConnect] code={code} socket={socket_code} msg={msg}")
 
         def OnProducts(self, value: str):
@@ -161,7 +163,8 @@ def _write_field_survey(state: _SpikeState, pump_name: str, args) -> Path:
     lines: list[str] = []
     lines.append("# 海外選擇權 欄位調查（Phase 0 spike 自動產出）")
     lines.append("")
-    lines.append(f"> 產生時間：{ts}　訊息泵：{pump_name}　連線碼 OnConnect={state.connect_code}")
+    lines.append(f"> 產生時間：{ts}　訊息泵：{pump_name}")
+    lines.append(f"> OnConnect 事件：{state.connect_events or '（未收到）'}")
     lines.append(f"> 參數：--symbols={args.symbols!r} --seconds={args.seconds} "
                  f"--products-only={args.products_only}")
     lines.append("")
@@ -279,8 +282,10 @@ def main() -> int:
                         help="訂閱後接收報價的秒數（盤中）")
     parser.add_argument("--products-only", action="store_true",
                         help="只抓商品清單後結束（建議第一次跑）")
-    parser.add_argument("--products-wait", type=int, default=8,
+    parser.add_argument("--products-wait", type=int, default=12,
                         help="等待 OnProducts 的秒數")
+    parser.add_argument("--connect-wait", type=int, default=15,
+                        help="輪詢 IsConnected 等連線就緒的最長秒數")
     args = parser.parse_args()
 
     user_id = os.getenv("CAPITAL_USER_ID", "")
@@ -310,16 +315,30 @@ def main() -> int:
         print("📊 連線報價伺服器（EnterMonitorLONG）…")
         code = oo_lib.SKOOQuoteLib_EnterMonitorLONG()
         print(f"   EnterMonitorLONG rc={code}")
-        pump(3)  # 等 OnConnect
-        if state.connect_code is None:
-            print("ℹ️  尚未收到 OnConnect（部分環境僅在訂閱後才回）；仍續試 RequestProducts")
-        elif state.connect_code != 0:
-            print(f"⚠️  OnConnect code={state.connect_code} 非成功碼，可能取不到商品檔/報價")
+
+        # 輪詢 SKOOQuoteLib_IsConnected()（1=連線中）直到就緒或逾時，邊 pump 邊等
+        connected = False
+        deadline = time.time() + args.connect_wait
+        while time.time() < deadline:
+            pump(0.5)
+            try:
+                if int(oo_lib.SKOOQuoteLib_IsConnected()) == 1:
+                    connected = True
+                    break
+            except Exception:  # noqa: BLE001
+                pass
+        if connected:
+            print(f"   ✅ IsConnected=1（連線就緒）。OnConnect 事件：{state.connect_events or '無'}")
+        else:
+            print(f"   ⚠️  {args.connect_wait}s 內未就緒（IsConnected≠1）。OnConnect 事件：{state.connect_events or '無'}")
+            print("      → 多半是非盤中 / 連線主機未開 / 帳號海期報價權限；商品檔/報價可能取不到。")
 
         print("📋 請求商品清單（RequestProducts）…")
         rc = oo_lib.SKOOQuoteLib_RequestProducts()
         print(f"   RequestProducts rc={rc}")
         pump(args.products_wait)
+        if not state.products:
+            print("   ⚠️  未收到 OnProducts（連線未就緒或等待不足；可加大 --products-wait）。")
 
         if not args.products_only and args.symbols.strip():
             symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]

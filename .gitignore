@@ -53,3 +53,6 @@ scripts/config.py
 
 # Windows COM 相關
 comtypes/gen/
+
+# Phase 0 spike 自動產出（每次跑覆寫，不入庫）
+docs/overseas_options_field_survey.md
