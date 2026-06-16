@@ -1,6 +1,6 @@
 # 交接：群益海外選擇權 → PostgreSQL → Excel (Black-76 + Greeks)
 
-> **狀態（2026-06-16）**：**Phase 0 + Phase 1 + Phase 2 完成**（Phase 2 migration `oseaopt01` 已套用 live macrodata DB、ORM round-trip 驗證綠、4-lens 對抗式複核 0 blocker）。下一步 = **Phase 3（macrodata `agencies/capital/` 串流 collector + ods_builder 算 IV + cli）**。
+> **狀態（2026-06-16）**：**Phase 0–3 程式碼完成**（Phase 2 migration `oseaopt01` 套用 live macrodata DB；Phase 3 macrodata collector/ods_builder/parser/cli + capital-api OptionQuote 補強，capital-api 41 測試 + macrodata 21 測試全綠、皆 commit/push）。下一步 = **① Phase 3 live 煙霧測試（盤中、需 COM + 群益帳號）② Phase 4 excel-builder**。
 
 ## 0. 先讀
 - 完整計畫（單一真相，頂部有架構決議）：`C:\Users\Essen\.claude\plans\capital-api-claude-md-postgresql-db-mac-unified-dongarra.md`
@@ -14,9 +14,9 @@
 ## 2. git 狀態
 | Repo | 路徑 | 分支 | 狀態 |
 |---|---|---|---|
-| capital-api | `D:\PythonProjects\capital-api` | `feat/overseas-options-ingestion` | HEAD `08e0e0e`，**已 push**（pricing+spike+tests+docs）|
+| capital-api | `D:\PythonProjects\capital-api` | `feat/overseas-options-ingestion` | HEAD `12ff7dc`（OptionQuote 加 raw 整數欄 + 修 3 解碼 bug；已 push）|
 | postgresql-db | `d:\PythonProjects\postgresql-db` | `feat/margin-ingestion` | **alembic head=`oseaopt01`（Phase 2 已套用 live macrodata DB；migration+model+exports 未 commit）** |
-| macrodata | `d:\PythonProjects\macrodata` | — | 已有 `agencies/capital/`；Phase 3 落這 |
+| macrodata | `d:\PythonProjects\macrodata` | `feat/overseas-options-agency` | Phase 3 commit `1f7f8ed`（已 push；建議 cherry-pick 進 main，避 superset/EIA WIP）|
 | excel-builder | `d:\PythonProjects\excel-builder` | — | 無 remote |
 
 ## 3. ✅ 已完成
@@ -69,12 +69,24 @@
 - 新檔 `src/db/models/overseas_option.py`（仿 `quote.py::ForeignFuturesBar1m`），於 `src/db/models/__init__.py` + `src/db/__init__.py` **雙重 import + `__all__`**。
 - 驗證：建表 + `timescaledb_information.hypertables` + COMMENT。
 
-## 5. Phase 3 — macrodata `agencies/capital/`（依 Phase 2）
-- `import capitalapi`（OptionsQuoteManager + pricing）+ `from db import …`。
-- `symbol_parser`（重用 `ref_market.margin_root_xref`；symbol 拆解見 spec §1）+ 商品檔 `{symbol→expiry}` map。
-- `collector.py`：主執行緒 pump（pythoncom）+ DB flush worker thread + `queue.Queue` + 斷線重連；**回調內禁 DB IO；COM 物件只主執行緒碰**。flush 2–3s。
-- `ods_builder.py`：raw → 算 expiry/T、取 F（parity）、option_mid、`pricing.implied_vol` → 寫 ods（不收斂 NULL + iv_status）。
-- option root → 標的期貨 root 對應（多數同名）；美債 32 分數制、單帳號訂閱上限壓測。
+## 5. ✅ Phase 3 — macrodata `agencies/capital/`（程式完成 2026-06-16，commit `1f7f8ed`，未做 live 煙霧）
+**已交付（branch `feat/overseas-options-agency`，21 測試綠）**：
+- `options_symbol.py`：symbol 純拆解（`{ROOT}{strike5}{月碼 A-L Call / M-X Put}{年末}`，含週選前綴/邊界/錯誤）。
+- `options_collector.py`：串流 daemon（pump 主緒 pythoncom + flush worker thread；**回調禁 DB IO、COM 只主緒**；
+  寫 raw **原始整數** → `raw_quotes.overseas_option_quote_snapshot`；同 flush 批共用 snapshot_ts 利 parity；
+  `fetch_products_map`/`save_expiry_map`/`load_expiry_map` 供 build-ods 取 expiry）。flush 預設 2s（env 可調）。
+- `options_ods.py`：`compute_iv_rows`（純函式：解碼 raw/10^dp + 日曆 T + **put-call parity 反推 F〔分組鍵含 expiry 避免跨月誤配〕**
+  + `capitalapi.pricing.implied_vol` Black-76 反解；不收斂/無價/到期/無標的 → NULL + iv_status）+ `build_ods_iv`（讀 raw→寫 ods）。
+- `options_config.py`（r/flush/連線參數，env 覆寫；憑證沿用 capital `.env` fallback）+ `cli.py` 加 `stream` / `build-ods`。
+- **capital-api 補強已並行完成（commit `12ff7dc`）**：`OptionQuote` 加 `raw_*` 整數欄 + `denominator`；修 3 解碼 bug
+  （sDecimal=0→divisor 1、strike 不除、保留 nDenominator）；`subscribe_many` 改 `#`；抽 `build_option_quote` 純函式。
+
+**▶️ 剩（下個 session）**：
+1. **Phase 3 live 煙霧測試（盤中、需 user 開群益帳號 + COM）**：`python -m mdw.agencies.capital.cli stream --root GC --seconds 60 --dump-expiry d:/tmp/oo_expiry.json`
+   → 驗 raw 每 symbol 每 ~2s 一列、無重複 PK、原始整數正確 → `... build-ods --products-json d:/tmp/oo_expiry.json --root GC` 驗 ATM IV>0。
+2. **collector 斷線重連未實作**（MVP；on_connection 重訂閱 + 指數退避，留 live 測試時補）。
+3. **單帳號訂閱上限壓測**（`--max-symbols`）；美債 32 分數制（denominator≠1）ODS 解碼分支。
+4. **macrodata Phase 3 cherry-pick 進 main**（比照 margin，避 superset/EIA WIP 污染）。
 
 ## 6. Phase 4 — excel-builder
 - `build_overseas_options_greeks_seed()` + CLI `design-overseas-options`；群益主題 + ODBC + Excel 公式 Black-76（**theta 用 `… + r*Call`**）。
