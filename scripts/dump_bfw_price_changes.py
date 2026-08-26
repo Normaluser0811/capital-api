@@ -296,19 +296,26 @@ def main() -> int:
             print("❌ 商品檔不完整，中止（不產出殘缺價格檔）")
             return 1
 
-        # 解每個 key 要抓的（exch, 具體代碼）
+        # 解每個 key 要抓的（exch, 具體代碼）。
+        # 🔴 解析失敗＝進 resolve_failed → 輸出「明確 null」（報告留空）。
+        # user 拍板（2026-08-26）：日報價格**只用群益**——群益拿不到就留空，
+        # 絕不讓 scraper 因缺 key 而 fallback 回 yfinance 期貨路徑。
         plan: dict[str, tuple[str, str, str]] = {}   # key -> (exch, code, 說明)
+        resolve_failed: dict[str, str] = {}          # key -> 原因
         for key, (exch, hot) in FUTURES_HOT.items():
             code = _hot_mapped_code(catalog, hot)
             if code and code in catalog:
                 plan[key] = (exch, code, f"HOT {hot} → {code}")
             else:
-                print(f"   ⚠️ {key}: HOT {hot} 映射失敗（order_code={catalog.get(hot, {}).get('order_code')}）")
+                resolve_failed[key] = (f"HOT {hot} 映射失敗"
+                                       f"（order_code={catalog.get(hot, {}).get('order_code')}）")
+                print(f"   ⚠️ {key}: {resolve_failed[key]}")
         for key, (exch, code) in SPOT.items():
             if code in catalog:
                 plan[key] = (exch, code, "spot")
             else:
-                print(f"   ⚠️ {key}: {exch},{code} 不在商品檔")
+                resolve_failed[key] = f"{exch},{code} 不在商品檔"
+                print(f"   ⚠️ {key}: {resolve_failed[key]}")
 
         print(f"📈 逐檔抓日K（{len(plan)} 檔）…")
         start_d = (as_of - timedelta(days=args.days)).strftime("%Y%m%d")
@@ -330,10 +337,20 @@ def main() -> int:
             closes = _parse_kline_rows(state.kline.get(code, []))
             result = _changes_from_closes(closes, as_of)
             if result is None:
+                # 只用群益：算不出＝明確 null（留空），不留給 yfinance fallback
                 problems.append(f"{key}（{exch},{code}：bar 不足或過期）")
+                prices[key] = {
+                    "daily_pct": None, "weekly_pct": None, "series": f"{exch},{code}",
+                    "resolve": f"{note}；bar 不足或過期 → 留空",
+                }
                 continue
             entry = {"series": f"{exch},{code}", "resolve": note, **result}
             prices[key] = entry
+        for key, reason in resolve_failed.items():
+            prices[key] = {
+                "daily_pct": None, "weekly_pct": None, "series": None,
+                "resolve": f"{reason} → 留空",
+            }
         for key in EXPLICIT_NULL:
             prices[key] = {
                 "daily_pct": None, "weekly_pct": None,
@@ -357,7 +374,7 @@ def main() -> int:
         for key, e in prices.items():
             d = f"{e['daily_pct']:+.2f}%" if e["daily_pct"] is not None else "—"
             w = f"{e['weekly_pct']:+.2f}%" if e["weekly_pct"] is not None else "—"
-            if e.get("series"):
+            if e.get("last_date"):
                 print(f"  {key:<14} 日 {d:>8} 週 {w:>8}  {e['series']:<15} "
                       f"{e['prev_date']}→{e['last_date']} {e['prev_close']}→{e['last_close']}")
             else:

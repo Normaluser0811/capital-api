@@ -27,8 +27,11 @@
 6. 雜項：`nClose=0`＝本節尚無成交哨兵要 guard；訂閱含無效代碼**整批**被拒（3023）；
    TY 32 分數制 API 已解成十進位（dec=6）。
 
-**同日午前追加（user 指示日報改群益價，已實戰上線一次）**：`scripts/dump_bfw_price_changes.py`
-產價格檔 → scraper `daily-report --price-file` 消費，08-26 全部 43 頁刪除重生成完成。
+**同日午前追加（user 指示日報改群益價，已實戰上線一次；隨後拍板**常態只用群益**）**：
+`scripts/dump_bfw_price_changes.py` 產價格檔 → scraper `daily-report --price-file` 消費，
+08-26 全部 43 頁刪除重生成完成。scraper 端已把 dump 接成 `--apply` 的**自動前置步驟**
+（scraper merge `95cbd48`；本腳本從此每天 06:30 被排程叫起，改動要顧向後相容：
+`--date`/`--out` 介面、exit code 語意、期貨/FX 失敗＝明確 null）。
 實戰又揭兩雷（已寫進 dump 註解）：① **INDEX 頁日K 不可信作昨收**（KOSPI 最後一根是
 「今天盤中值掛昨天日期」，歷史列與 DB 全等唯最後一根不等）→ 指數剔除、走 scraper DB
 fallback；② **極薄合約（COMEX 鋁）最後成交序列是垃圾**（ALI2608 零成交＝結算順延平 bar
