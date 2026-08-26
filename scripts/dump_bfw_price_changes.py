@@ -78,9 +78,6 @@ FUTURES_HOT: dict[str, tuple[str, str]] = {
     "rbob_gasoline": ("NYM", "RB0000"),
     "feeder_cattle": ("CME", "FC0000"),
 }
-FUTURES_FRONT: dict[str, tuple[str, str]] = {
-    "aluminum": ("NYM", "ALI"),      # 無 HOT，逐月自選近月
-}
 SPOT: dict[str, tuple[str, str]] = {
     "jpy": ("FX", "SUSDJPY"),
     "gbp": ("FX", "SGBPUSD"),
@@ -88,12 +85,20 @@ SPOT: dict[str, tuple[str, str]] = {
     "chf": ("FX", "SUSDCHF"),
     "cad": ("FX", "SUSDCAD"),
     "aud": ("FX", "SAUDUSD"),
-    "nikkei": ("INDEX", "NI225"),
-    "kospi": ("INDEX", "KOSPI"),
-    "hang_seng": ("INDEX", "HHHSI"),
+    # 🔴 INDEX 頁三檔（NI225/KOSPI/HHHSI）2026-08-26 實測後剔除：KOSPI 的日K 最後一根
+    # 是「今天盤中值掛昨天日期」（歷史列與 DB ^KS11 逐日全等、唯最後一根 6742.74 vs
+    # 真值 6642.71），拿它當昨收會把盤中值發成昨日漲跌 → 指數一律走 scraper 的 DB
+    # fallback（現貨指數序列無合約無換月，本來就乾淨）。
 }
-# 群益無同口徑來源（sp500/dow/taiex 走 scraper DB fallback；恆科/A50 本來就留空）
-UNCOVERED = ("sp500", "dow", "taiex", "hang_seng_tech", "ftse_a50")
+# 明確標 null 的商品（列進 prices 但值為 null＝報告留空、scraper 不 fallback）：
+# aluminum：COMEX 鋁極薄——ALI2608 全零成交（KLine 是結算價順延的平 bar，日漲跌
+# 算出來是「前一天」的變動）、ALI2609 最後成交離結算 2.7%。任何最後成交序列都不可信，
+# 群益 API 又拿不到結算價歷史 → 寧可留空。
+EXPLICIT_NULL = ("aluminum",)
+# 群益無同口徑來源（sp500/dow/taiex/nikkei/kospi/hang_seng 走 scraper DB fallback；
+# 恆科/A50 本來就留空）
+UNCOVERED = ("sp500", "dow", "taiex", "nikkei", "kospi", "hang_seng",
+             "hang_seng_tech", "ftse_a50")
 
 _STALE_DAYS = 7
 
@@ -191,22 +196,6 @@ def _hot_mapped_code(catalog: dict[str, dict], hot_code: str) -> str | None:
         return None
     quote_root = hot_code[:-4]  # 去掉 '0000'
     return f"{quote_root}{m.group(1)[2:]}"
-
-
-def _front_month_code(catalog: dict[str, dict], root: str, as_of: _date) -> str | None:
-    """無 HOT 的商品：挑「LTD >= as_of 的最近月份」（跳過價差單）。"""
-    best: tuple[str, str] | None = None
-    for code, rec in catalog.items():
-        if not re.fullmatch(re.escape(root) + r"\d{4}", code):
-            continue
-        ltd = rec.get("ltd", "")
-        if not re.fullmatch(r"\d{8}", ltd) or ltd in ("0", "99991231"):
-            continue
-        if _date(int(ltd[:4]), int(ltd[4:6]), int(ltd[6:])) < as_of:
-            continue
-        if best is None or ltd < best[0]:
-            best = (ltd, code)
-    return best[1] if best else None
 
 
 def _changes_from_closes(closes: dict[_date, float], as_of: _date):
@@ -315,12 +304,6 @@ def main() -> int:
                 plan[key] = (exch, code, f"HOT {hot} → {code}")
             else:
                 print(f"   ⚠️ {key}: HOT {hot} 映射失敗（order_code={catalog.get(hot, {}).get('order_code')}）")
-        for key, (exch, root) in FUTURES_FRONT.items():
-            code = _front_month_code(catalog, root, as_of)
-            if code:
-                plan[key] = (exch, code, f"front-month {root} → {code}")
-            else:
-                print(f"   ⚠️ {key}: 找不到 {root} 近月")
         for key, (exch, code) in SPOT.items():
             if code in catalog:
                 plan[key] = (exch, code, "spot")
@@ -351,6 +334,12 @@ def main() -> int:
                 continue
             entry = {"series": f"{exch},{code}", "resolve": note, **result}
             prices[key] = entry
+        for key in EXPLICIT_NULL:
+            prices[key] = {
+                "daily_pct": None, "weekly_pct": None,
+                "series": None,
+                "resolve": "極薄合約，最後成交序列不可信（見 EXPLICIT_NULL 註解）→ 留空",
+            }
 
         payload = {
             "version": 1,
@@ -368,8 +357,11 @@ def main() -> int:
         for key, e in prices.items():
             d = f"{e['daily_pct']:+.2f}%" if e["daily_pct"] is not None else "—"
             w = f"{e['weekly_pct']:+.2f}%" if e["weekly_pct"] is not None else "—"
-            print(f"  {key:<14} 日 {d:>8} 週 {w:>8}  {e['series']:<15} "
-                  f"{e['prev_date']}→{e['last_date']} {e['prev_close']}→{e['last_close']}")
+            if e.get("series"):
+                print(f"  {key:<14} 日 {d:>8} 週 {w:>8}  {e['series']:<15} "
+                      f"{e['prev_date']}→{e['last_date']} {e['prev_close']}→{e['last_close']}")
+            else:
+                print(f"  {key:<14} 日 {d:>8} 週 {w:>8}  （明確留空：{e['resolve']}）")
         if problems:
             print(f"  ⚠️ 失敗：{problems}")
         print(f"  （fallback 給 scraper 既有路徑：{UNCOVERED}）")

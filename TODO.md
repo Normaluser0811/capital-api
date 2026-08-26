@@ -27,8 +27,17 @@
 6. 雜項：`nClose=0`＝本節尚無成交哨兵要 guard；訂閱含無效代碼**整批**被拒（3023）；
    TY 32 分數制 API 已解成十進位（dec=6）。
 
+**同日午前追加（user 指示日報改群益價，已實戰上線一次）**：`scripts/dump_bfw_price_changes.py`
+產價格檔 → scraper `daily-report --price-file` 消費，08-26 全部 43 頁刪除重生成完成。
+實戰又揭兩雷（已寫進 dump 註解）：① **INDEX 頁日K 不可信作昨收**（KOSPI 最後一根是
+「今天盤中值掛昨天日期」，歷史列與 DB 全等唯最後一根不等）→ 指數剔除、走 scraper DB
+fallback；② **極薄合約（COMEX 鋁）最後成交序列是垃圾**（ALI2608 零成交＝結算順延平 bar
+→ 日漲跌算成前一天的；ALI2609 最後成交離結算 2.7%）→ EXPLICIT_NULL 留空。
+主交接 → scraper/next_session_prompt.md §-1.0b。
+
 **🔜 下一步＝Phase A1**：capital-api 補海期 SKOSQuoteLib 封裝（純 library，比照海選
 `options_quote.py` 模式；API 面清單見結論文件 §「對 Phase A1/A2 的直接輸入」）。
+A1 設計要吸收上面兩雷（KLine 週漲跌 API 面應內建「指數頁禁用/薄合約偵測」守衛）。
 ⚠️ 本分支疊在 `feat/overseas-options-ingestion` 上（該分支 6 月完工、push 過但**尚未併 main**，
 交接文件只存在於該分支）——併版時兩支一起處理，或先併父分支再併本支。
 
