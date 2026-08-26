@@ -520,17 +520,28 @@ def main() -> int:
                 resolve_failed[key] = f"{root} 無可用月份（SETTLE_CHAIN）"
                 print(f"   ⚠️ {key}: {resolve_failed[key]}")
 
-        # SPOT_INDEX 混合法 + SETTLE_CHAIN 的快照：訂閱後等全部到、或 10s 上限
-        snap_plan = {**spot_index_plan, **chain_plan}
-        if snap_plan:
-            nos = "#".join(f"{e},{c}" for e, c in snap_plan.values())
+        # 快照訂閱（結算價鏈 + SPOT_INDEX 混合法都要）：
+        # 🔴 user 拍板（2026-08-26 第五輪）：**全期貨改結算價鏈**——每檔期貨的快照 nRef
+        # ＝正式結算價，逐日存狀態檔；鏈未接上（冷啟動/換約日）退回同合約最後成交鏈
+        # 並在 resolve 註明。FX 現貨無結算概念（nRef=NY 17:00 昨收＝KLine 同口徑）維持
+        # KLine；SPOT_INDEX 維持混合法（現貨收盤口徑）。
+        futures_keys = {k for k in plan if k in FUTURES_HOT}
+        snap_codes = {c for k, (_e, c, _n) in plan.items() if k in futures_keys}
+        snap_codes |= {c for _e, c in spot_index_plan.values()}
+        snap_codes |= {c for _e, c in chain_plan.values()}
+        if snap_codes:
+            code2exch = {c: e for k, (e, c, _n) in plan.items()}
+            code2exch.update({c: e for e, c in spot_index_plan.values()})
+            code2exch.update({c: e for e, c in chain_plan.values()})
+            nos = "#".join(f"{code2exch[c]},{c}" for c in sorted(snap_codes))
             page, rc = os_lib.SKOSQuoteLib_RequestStocks(-1, nos)
-            print(f"📸 快照訂閱 rc={rc} page={page}：{nos}")
+            print(f"📸 快照訂閱 {len(snap_codes)} 檔 rc={rc} page={page}")
             t0 = time.time()
-            wanted = {c for _, c in snap_plan.values()}
-            while time.time() - t0 < 10 and not wanted <= set(state.quotes):
+            while time.time() - t0 < 15 and not snap_codes <= set(state.quotes):
                 pump(0.5)
-            print(f"   快照到位：{sorted(set(state.quotes) & wanted)}")
+            missing = snap_codes - set(state.quotes)
+            print(f"   快照到位 {len(snap_codes) - len(missing)}/{len(snap_codes)}"
+                  + (f"，未到：{sorted(missing)}" if missing else ""))
 
         print(f"📈 逐檔抓日K（{len(plan) + len(spot_index_plan)} 檔）…")
         start_d = (as_of - timedelta(days=args.days)).strftime("%Y%m%d")
@@ -551,26 +562,59 @@ def main() -> int:
 
         prices: dict[str, dict] = {}
         problems: list[str] = []
+        settle_state = _load_settle_state()
         for key, (exch, code, note) in plan.items():
+            series = f"{exch},{code}"
             closes = _parse_kline_rows(state.kline.get(code, []))
-            result = _changes_from_closes(closes, as_of)
-            if result is None:
-                # 只用群益：算不出＝明確 null（留空），不留給 yfinance fallback
-                problems.append(f"{key}（{exch},{code}：bar 不足或過期）")
+            cc = _changes_from_closes(closes, as_of)   # 同合約最後成交鏈（fallback/週過渡）
+
+            if key in futures_keys:
+                se = _settle_chain_changes(key, code, state.quotes.get(code), as_of,
+                                           settle_state, series)
+                if se["daily_pct"] is not None:
+                    # 結算鏈為主；週漲跌：結算歷史滿 7 天前用最後成交鏈過渡
+                    weekly = se["weekly_pct"]
+                    wk_src = "結算鏈"
+                    if weekly is None and cc is not None:
+                        weekly = cc["weekly_pct"]
+                        wk_src = "最後成交鏈(過渡)"
+                    prices[key] = {
+                        "series": series,
+                        "resolve": f"{note}；日=結算鏈、週={wk_src}",
+                        "daily_pct": se["daily_pct"], "weekly_pct": weekly,
+                        "last_date": se["last_date"], "last_close": se["last_close"],
+                        "prev_date": "結算鏈", "prev_close": None,
+                    }
+                    continue
+                # 鏈未接上（冷啟動/換約日）→ 同合約最後成交鏈 fallback（resolve 註明）
+                if cc is not None:
+                    prices[key] = {
+                        "series": series,
+                        "resolve": f"{note}；結算鏈未接上（{se['resolve'][:60]}）"
+                                   "→ 本日用同合約最後成交鏈",
+                        **cc,
+                    }
+                    continue
+                problems.append(f"{key}（{series}：結算鏈未接上且 bar 不足）")
+                prices[key] = {"daily_pct": None, "weekly_pct": None, "series": series,
+                               "resolve": f"{note}；結算鏈未接上且 bar 不足 → 留空"}
+                continue
+
+            # FX 現貨：維持 KLine 最後成交鏈（nRef=NY 17:00 昨收，同口徑）
+            if cc is None:
+                problems.append(f"{key}（{series}：bar 不足或過期）")
                 prices[key] = {
-                    "daily_pct": None, "weekly_pct": None, "series": f"{exch},{code}",
+                    "daily_pct": None, "weekly_pct": None, "series": series,
                     "resolve": f"{note}；bar 不足或過期 → 留空",
                 }
                 continue
-            entry = {"series": f"{exch},{code}", "resolve": note, **result}
-            prices[key] = entry
+            prices[key] = {"series": series, "resolve": note, **cc}
         for key, (exch, code) in spot_index_plan.items():
             closes = _parse_kline_rows(state.kline.get(code, []))
             entry = _hybrid_index_changes(state.quotes.get(code), closes, as_of, f"{exch},{code}")
             if entry["daily_pct"] is None:
                 problems.append(f"{key}（{entry['resolve']}）")
             prices[key] = entry
-        settle_state = _load_settle_state()
         for key, (exch, code) in chain_plan.items():
             entry = _settle_chain_changes(key, code, state.quotes.get(code), as_of,
                                           settle_state, f"{exch},{code}")
