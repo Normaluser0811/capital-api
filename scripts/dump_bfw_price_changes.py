@@ -77,6 +77,17 @@ FUTURES_HOT: dict[str, tuple[str, str]] = {
     "natural_gas": ("NYM", "NG0000"),
     "rbob_gasoline": ("NYM", "RB0000"),
     "feeder_cattle": ("CME", "FC0000"),
+    # 指數期貨（2026-08-26 user 指正後補上）。⚠️ 亞系指數期貨的日 bar 含夜盤到凌晨
+    # （含美股時段），close-chain 與現貨收盤漲跌可以差到方向翻轉（實測富時台期貨
+    # +0.43% vs 加權指數 -0.55%）——所以只有下列兩類進這張表：
+    # ① 美系（ES/YM）：期貨收盤 16:00 CT vs 現貨 15:00 CT，口徑差 ~0.1pp 可忽略；
+    # ② 恆科/A50：無現貨源（原本永遠留空），期貨 close-chain 自身一致，標注口徑。
+    # 日經/恆生/Kospi 走 SPOT_INDEX 混合法（現貨口徑）；台股 taiex 群益無可用源
+    # （富時台≠加權且含夜盤、國內指數線需證券帳戶）→ UNCOVERED 留 DB。
+    "sp500": ("CME", "ES0000"),             # 小SP
+    "dow": ("CBOT", "YM0000"),              # 小道
+    "hang_seng_tech": ("HKEx", "HTI0000"),  # 恆生科技（期貨口徑，含夜盤）
+    "ftse_a50": ("SGX", "CN0000"),          # 富時A50（期貨口徑，含夜盤）
 }
 SPOT: dict[str, tuple[str, str]] = {
     "jpy": ("FX", "SUSDJPY"),
@@ -85,20 +96,26 @@ SPOT: dict[str, tuple[str, str]] = {
     "chf": ("FX", "SUSDCHF"),
     "cad": ("FX", "SUSDCAD"),
     "aud": ("FX", "SAUDUSD"),
-    # 🔴 INDEX 頁三檔（NI225/KOSPI/HHHSI）2026-08-26 實測後剔除：KOSPI 的日K 最後一根
-    # 是「今天盤中值掛昨天日期」（歷史列與 DB ^KS11 逐日全等、唯最後一根 6742.74 vs
-    # 真值 6642.71），拿它當昨收會把盤中值發成昨日漲跌 → 指數一律走 scraper 的 DB
-    # fallback（現貨指數序列無合約無換月，本來就乾淨）。
+}
+# 🔴 INDEX 現貨頁三檔走「混合法」（2026-08-26 定案）：
+# - 日K 最後一根不可信——KOSPI 實測「今天盤中值掛昨天日期」（歷史列與 DB ^KS11 逐日
+#   全等、唯最後一根 6742.74 vs 真值 6642.71）。
+# - 但快照的 nRef＝現貨**正式昨收**（NI225 實測 65856.43＝08-25 收盤，逐位吻合）。
+# ⇒ 昨收用快照（nRef 或未開盤時 nClose）、前日收/週基準用日K「完成 bar」（< 昨收日），
+#   兩種盤態都不吃日K 最後一根 → 污染免疫，且數字＝現貨口徑（與新聞收盤行情一致）。
+SPOT_INDEX: dict[str, tuple[str, str]] = {
+    "nikkei": ("INDEX", "NI225"),
+    "kospi": ("INDEX", "KOSPI"),
+    "hang_seng": ("INDEX", "HHHSI"),
 }
 # 明確標 null 的商品（列進 prices 但值為 null＝報告留空、scraper 不 fallback）：
 # aluminum：COMEX 鋁極薄——ALI2608 全零成交（KLine 是結算價順延的平 bar，日漲跌
 # 算出來是「前一天」的變動）、ALI2609 最後成交離結算 2.7%。任何最後成交序列都不可信，
 # 群益 API 又拿不到結算價歷史 → 寧可留空。
 EXPLICIT_NULL = ("aluminum",)
-# 群益無同口徑來源（sp500/dow/taiex/nikkei/kospi/hang_seng 走 scraper DB fallback；
-# 恆科/A50 本來就留空）
-UNCOVERED = ("sp500", "dow", "taiex", "nikkei", "kospi", "hang_seng",
-             "hang_seng_tech", "ftse_a50")
+# 群益無可用源：台股加權——富時台期貨口徑不同且含夜盤（實測日漲跌方向翻轉）、
+# 國內上市櫃指數線需證券帳戶 → 走 scraper DB fallback（^TWII 現貨，乾淨）。
+UNCOVERED = ("taiex",)
 
 _STALE_DAYS = 7
 
@@ -110,6 +127,7 @@ class _State:
         self.last_frag_ts: float | None = None
         self.kline: dict[str, list[str]] = {}
         self.kline_last_ts: float | None = None
+        self.quotes: dict[str, dict] = {}   # code -> {close, ref, day}（已除 10^sDecimal）
 
 
 def _make_pump():
@@ -124,7 +142,7 @@ def _make_pump():
     return pump
 
 
-def _build_event(state: _State):
+def _build_event(state: _State, os_lib, sk):
     class Ev:
         def OnConnect(self, code, socket_code):
             print(f"[OnConnect] code={code} socket={socket_code}")
@@ -142,8 +160,21 @@ def _build_event(state: _State):
             state.kline.setdefault(str(stock_no), []).append(str(data))
             state.kline_last_ts = time.time()
 
-        def OnNotifyQuoteLONG(self, *a):
-            pass
+        def OnNotifyQuoteLONG(self, index):
+            # SPOT_INDEX 混合法用：抓現貨頁快照的 nClose/nRef/nTradingDay
+            try:
+                stock = sk.SKFOREIGNLONG()
+                stock, rc = os_lib.SKOSQuoteLib_GetStockByIndexLONG(index, stock)
+                if rc != 0:
+                    return
+                divisor = 10 ** int(stock.sDecimal)
+                state.quotes[str(stock.bstrStockNo)] = {
+                    "close": stock.nClose / divisor,
+                    "ref": stock.nRef / divisor,
+                    "day": int(stock.nTradingDay),
+                }
+            except Exception as exc:  # noqa: BLE001
+                print(f"[OnNotifyQuoteLONG] 解析失敗: {exc}")
 
         def OnNotifyTicksNineDigitLONG(self, *a):
             pass
@@ -225,6 +256,63 @@ def _changes_from_closes(closes: dict[_date, float], as_of: _date):
     }
 
 
+def _hybrid_index_changes(q: dict | None, closes: dict[_date, float], as_of: _date,
+                          series: str) -> dict:
+    """SPOT_INDEX 混合法：昨收取快照（污染免疫）、前日收/週基準取日K 完成列。
+
+    兩種盤態（A0 Q3 語意）：
+    - 快照 day == as_of（今天已開盤）：昨收＝nRef；前日收＝日K「昨天以前」的最大完成列
+      （「昨天」那根日期可信、值不可信——KOSPI 污染列掛的就是昨天日期，故只取其日期）。
+    - 快照 day < as_of（未開盤）：昨收＝nClose、前日收＝nRef（全快照，日K 只供週基準）。
+    """
+    def _null(reason: str) -> dict:
+        return {"daily_pct": None, "weekly_pct": None, "series": series,
+                "resolve": f"混合法失敗：{reason} → 留空"}
+
+    if not q or not q.get("ref"):
+        return _null("快照未取得（nRef 空）")
+    day = q["day"]
+    try:
+        day_d = _date(day // 10000, day // 100 % 100, day % 100)
+    except ValueError:
+        return _null(f"nTradingDay 異常（{day}）")
+    dates = sorted(d for d in closes if d < as_of and d.weekday() < 5)
+
+    if day_d >= as_of:
+        # 今天已開盤：昨收=nRef；昨收日=日K < as_of 的最大日期（僅取日期）
+        if len(dates) < 2:
+            return _null("日K 完成列不足")
+        last_date, prev_date = dates[-1], dates[-2]
+        last_val = q["ref"]
+        prev_val = closes[prev_date]
+        mode = f"開盤中：昨收=nRef({last_val})、前日收=日K {prev_date}"
+    else:
+        # 未開盤：快照本身就是已完成日
+        last_date = day_d
+        last_val = q["close"]
+        prev_val = q["ref"]
+        mode = f"未開盤：昨收=nClose({last_val})、前日收=nRef({prev_val})"
+
+    if (as_of - last_date).days > _STALE_DAYS:
+        return _null(f"昨收日 {last_date} 距 as_of 過久")
+    daily = (last_val / prev_val - 1) * 100 if prev_val else None
+
+    weekly = None
+    week_ago = last_date - timedelta(days=7)
+    for d in reversed([d for d in dates if d < last_date]):
+        if d <= week_ago:
+            weekly = (last_val / closes[d] - 1) * 100 if closes[d] else None
+            break
+
+    return {
+        "series": series, "resolve": f"SPOT_INDEX 混合法（{mode}）",
+        "daily_pct": round(daily, 4) if daily is not None else None,
+        "weekly_pct": round(weekly, 4) if weekly is not None else None,
+        "last_date": last_date.isoformat(), "last_close": last_val,
+        "prev_date": str(prev_date if day_d >= as_of else "快照nRef"), "prev_close": prev_val,
+    }
+
+
 def _parse_kline_rows(rows: list[str]) -> dict[_date, float]:
     closes: dict[_date, float] = {}
     for row in rows:
@@ -268,8 +356,8 @@ def main() -> int:
         print(f"📡 登入群益… as_of={as_of}")
         client.login(user_id, password)
         os_lib = create_os_quote_lib()
-        get_sk_module()
-        handler = comtypes.client.GetEvents(os_lib, _build_event(state))
+        sk = get_sk_module()
+        handler = comtypes.client.GetEvents(os_lib, _build_event(state, os_lib, sk))
 
         rc = os_lib.SKOSQuoteLib_EnterMonitorLONG()
         print(f"EnterMonitorLONG rc={rc}")
@@ -316,11 +404,32 @@ def main() -> int:
             else:
                 resolve_failed[key] = f"{exch},{code} 不在商品檔"
                 print(f"   ⚠️ {key}: {resolve_failed[key]}")
+        spot_index_plan: dict[str, tuple[str, str]] = {}
+        for key, (exch, code) in SPOT_INDEX.items():
+            if code in catalog:
+                spot_index_plan[key] = (exch, code)
+            else:
+                resolve_failed[key] = f"{exch},{code} 不在商品檔"
+                print(f"   ⚠️ {key}: {resolve_failed[key]}")
 
-        print(f"📈 逐檔抓日K（{len(plan)} 檔）…")
+        # SPOT_INDEX 混合法的快照（昨收錨）：訂閱後等三檔都到、或 10s 上限
+        if spot_index_plan:
+            nos = "#".join(f"{e},{c}" for e, c in spot_index_plan.values())
+            page, rc = os_lib.SKOSQuoteLib_RequestStocks(-1, nos)
+            print(f"📸 SPOT_INDEX 快照訂閱 rc={rc} page={page}：{nos}")
+            t0 = time.time()
+            wanted = {c for _, c in spot_index_plan.values()}
+            while time.time() - t0 < 10 and not wanted <= set(state.quotes):
+                pump(0.5)
+            print(f"   快照到位：{sorted(set(state.quotes) & wanted)}")
+
+        print(f"📈 逐檔抓日K（{len(plan) + len(spot_index_plan)} 檔）…")
         start_d = (as_of - timedelta(days=args.days)).strftime("%Y%m%d")
         end_d = as_of.strftime("%Y%m%d")
-        for key, (exch, code, note) in plan.items():
+        kline_targets = dict(plan)
+        for key, (exch, code) in spot_index_plan.items():
+            kline_targets[key] = (exch, code, "spot_index(週基準/前日收)")
+        for key, (exch, code, note) in kline_targets.items():
             rc = os_lib.SKOSQuoteLib_RequestKLineByDate(f"{exch},{code}", 1, start_d, end_d, 1)
             t0 = time.time()
             # 等這一檔的資料到齊（idle 2s）再抓下一檔，避免事件交錯時難定位缺漏
@@ -345,6 +454,12 @@ def main() -> int:
                 }
                 continue
             entry = {"series": f"{exch},{code}", "resolve": note, **result}
+            prices[key] = entry
+        for key, (exch, code) in spot_index_plan.items():
+            closes = _parse_kline_rows(state.kline.get(code, []))
+            entry = _hybrid_index_changes(state.quotes.get(code), closes, as_of, f"{exch},{code}")
+            if entry["daily_pct"] is None:
+                problems.append(f"{key}（{entry['resolve']}）")
             prices[key] = entry
         for key, reason in resolve_failed.items():
             prices[key] = {
