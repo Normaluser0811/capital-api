@@ -4,17 +4,22 @@
 群益 API 報價）。這是 A1/A2 正式管線落地前的過渡工具——COM 只在本腳本內使用，
 scraper 生成管線不碰 COM。
 
-方法（依 Phase A0 結論 `docs/overseas_futures_spike_a0.md`）：
-- 期貨：由 `GetOverseaProductDetail(1)` 的下單代碼 `{root}_{YYYYMM}` 解出 HOT 當下
-  映射的**具體合約**，抓該合約自身日K 算漲跌。🔴 絕不用 HOT 的 KLine 算跨日漲跌
-  ——它是換月拼接序列（KC0000 實證），與 yfinance 同一種雷。
-- 鋁（無 HOT）：從商品檔挑「最後交易日 >= as_of 的最近月份」當近月。
-- FX 現貨頁／INDEX 延遲頁：代碼自身日K（無合約無換月）。
+方法（依 Phase A0 結論 `docs/overseas_futures_spike_a0.md` + 2026-08-28 覆核計畫）：
+- 期貨＝**結算價鏈**：快照 nRef/nSettle＝正式結算價，逐日存 `data/bfw_settle_state.json`，
+  日漲跌＝今結算/昨結算（同合約）。🔴 昨結「鏈 history 優先、nRef 只當 fallback」
+  ——SGX 收盤後會把 nRef 改寫成非昨結的值（2026-08-28 橡膠 +0.08% vs 真值 +1.14%）。
+- **最活絡月自動換月**（2026-08-28）：候選＝LTD 排序近月＋次月（錨＝state active 與
+  HOT 映射較晚者，單向不回滾；鋁無 HOT 走同一套）；次月連 2 完成日成交量 > 近月
+  → 切換報導合約（橘子汁：HOT 08-28 仍指 Sep、市場 08-24 已移倉 Nov）。兩條鏈
+  平常一起養（雙合約 state），切換日昨結已在鏈上＝無縫。
+  🔴 絕不用 HOT 的 KLine 算跨日漲跌——它是換月拼接序列（KC0000 實證），
+  與 yfinance 同一種雷。
+- FX 現貨頁／INDEX 延遲頁：代碼自身日K（無合約無換月）；INDEX 走混合法。
 - 漲跌幅語意**鏡射 scraper `materials._changes_from_closes`**：只取 `< as_of` 且
   非週末的 bar；日＝最近一根 vs 前一根；週＝最近一根 vs 最近的「≤7 日曆天前」bar；
   最近 bar 距 as_of > 7 天＝過期序列 → 整組留空。
-- ⚠️ KLine 收盤欄＝最後成交價非結算價（A0 結論）；與 yfinance 日線口徑一致，
-  但與交易所正式結算可有 ~0.1-0.5% 差（黃金 08-25 實測 4715.9 vs 結算 4694.5）。
+- ⚠️ KLine 收盤欄＝最後成交價非結算價（A0 結論）——只用於週漲跌過渡與
+  鏈未接上的 fallback；成交量欄（parts[5]）供滾月判準。
 
 用法：
   python scripts/dump_bfw_price_changes.py                  # as_of=今天（台北）
@@ -112,7 +117,8 @@ SPOT_INDEX: dict[str, tuple[str, str]] = {
 # （ALI2608 全零成交＝結算順延平 bar；ALI2609 最後成交離結算 2.7%），但快照 nRef＝
 # **正式結算價**（零成交日交易所也每天發布）。dump 每天把 nRef 存進 data/ 狀態檔，
 # 隔日起用「今結算/昨結算」算日漲跌（同合約、結算對結算）；週漲跌等歷史累積滿 7 天。
-# 冷啟動：首日留空。合約選「LTD ≥ as_of+3 天的最近月」，換約時鏈重啟（再空一天）。
+# 冷啟動：首日留空。無 HOT → 候選走 LTD 近月/次月同一套（雙鏈平養，換約無縫）；
+# 鏈未接上**不退**最後成交鏈（極薄合約序列是雜訊）。
 SETTLE_CHAIN: dict[str, tuple[str, str]] = {
     "aluminum": ("NYM", "ALI"),
 }
@@ -318,20 +324,57 @@ def _hybrid_index_changes(q: dict | None, closes: dict[_date, float], as_of: _da
     }
 
 
-def _chain_front_contract(catalog: dict[str, dict], root: str, as_of: _date) -> str | None:
-    """SETTLE_CHAIN 用：挑「LTD ≥ as_of+3 天的最近月」（避開臨到期月，減少換約頻率）。"""
-    best: tuple[str, str] | None = None
+def _month_codes(catalog: dict[str, dict], quote_root: str, as_of: _date) -> list[str]:
+    """root 的逐月報價代碼，依 LTD 升冪；只留 LTD ≥ as_of+3 天（臨到期月＝強制滾月保險）。
+
+    比對沿用「報價 root + 4 位數字」fullmatch（與舊 _chain_front_contract 同款；
+    刻意不比對交易所欄——catalog 的 exch 欄格式未經驗證，錯比會整批落空）。
+    """
+    out: list[tuple[str, str]] = []
     for code, rec in catalog.items():
-        if not re.fullmatch(re.escape(root) + r"\d{4}", code):
+        if not re.fullmatch(re.escape(quote_root) + r"\d{4}", code):
             continue
         ltd = rec.get("ltd", "")
         if not re.fullmatch(r"\d{8}", ltd) or ltd in ("0", "99991231"):
             continue
-        if _date(int(ltd[:4]), int(ltd[4:6]), int(ltd[6:])) < as_of + timedelta(days=3):
+        try:
+            ltd_d = _date(int(ltd[:4]), int(ltd[4:6]), int(ltd[6:]))
+        except ValueError:
             continue
-        if best is None or ltd < best[0]:
-            best = (ltd, code)
-    return best[1] if best else None
+        if ltd_d < as_of + timedelta(days=3):
+            continue
+        out.append((ltd, code))
+    return [c for _ltd, c in sorted(out)]
+
+
+def _pick_candidates(months: list[str], anchors: list[str | None]) -> tuple[str, str | None]:
+    """候選＝(近月, 次月)。錨（state active_code / HOT 映射月）取「較晚 LTD」者＝單向不回滾；
+    錨不在 months（已被 LTD 濾掉）→ 從第一個可用月起＝強制滾月。"""
+    idx = 0
+    for a in anchors:
+        if a and a in months:
+            idx = max(idx, months.index(a))
+    front = months[idx]
+    nxt = months[idx + 1] if idx + 1 < len(months) else None
+    return front, nxt
+
+
+def _should_roll(front_bars: dict[_date, dict], next_bars: dict[_date, dict],
+                 as_of: _date) -> bool:
+    """最活絡月判準：次月「最近 2 個完成交易日」成交量皆 > 近月 → 切換報導合約。
+
+    群益海外報價無未平倉量欄（A0 實證）——volume 是唯一可得判準。
+    零成交/假日/as_of 當天（進行中）bar 不計入；有效共同日不足 2 → 不切（保守）。
+    """
+    common = sorted(
+        d for d in front_bars
+        if d in next_bars and d < as_of and d.weekday() < 5
+        and (front_bars[d].get("volume") or 0) > 0
+        and (next_bars[d].get("volume") or 0) > 0
+    )
+    if len(common) < 2:
+        return False
+    return all(next_bars[d]["volume"] > front_bars[d]["volume"] for d in common[-2:])
 
 
 def _load_settle_state() -> dict:
@@ -341,53 +384,100 @@ def _load_settle_state() -> dict:
         return {}
 
 
-def _settle_chain_changes(key: str, code: str, q: dict | None, as_of: _date,
-                          settle_state: dict, series: str) -> dict:
-    """結算價累積法：日漲跌＝今結算/昨結算（快照 nRef 逐日累積）。
+def _migrate_settle_entry(st: dict) -> dict:
+    """舊 schema `{code, history}` → `{active_code, chains: {code: {history}}}`（冪等）。"""
+    if "chains" in st:
+        return st
+    out: dict = {"active_code": st.get("code"), "chains": {}}
+    if st.get("code"):
+        out["chains"][st["code"]] = {"history": dict(st.get("history", {}))}
+    if st.get("updated"):
+        out["updated"] = st["updated"]
+    return out
 
-    - 已收盤（day < as_of）：daily = nSettle/nRef 直接（快照自帶結算對）。
-    - 盤中（day >= as_of）：nRef=昨結；昨結存檔、與**上一個交易日**存的 nRef 相除。
-      上一筆不是前一交易日（週末容忍 ≤4 日曆天）或換了合約 → 留空（鏈重啟）。
-    - 週漲跌：歷史滿 7 日曆天才有值。狀態檔同時被本函式更新（呼叫端負責存檔）。
+
+def _feed_chain(entry: dict, code: str, q: dict | None,
+                as_of: _date) -> tuple[_date, _date, float] | None:
+    """把本次快照的結算價寫進**該合約自身**的鏈（近月/次月平常一起養＝切換日無縫）。
+
+    回傳 (day_d, settle_date, settle_val)；快照缺/壞 → None（不動鏈）。
+    - 已收盤（day < as_of）：settle_date=day、值=nSettle（0 哨兵退用 nRef）。
+    - 盤中（day >= as_of）：nRef=昨結 → settle_date=前一平日。
+    """
+    if not q or not q.get("ref"):
+        return None
+    day = q["day"]
+    try:
+        day_d = _date(day // 10000, day // 100 % 100, day % 100)
+    except ValueError:
+        return None
+    ch = entry.setdefault("chains", {}).setdefault(code, {"history": {}})
+    hist = ch["history"]
+    if day_d < as_of:
+        settle_date = day_d
+        # nSettle=0 哨兵時先信鏈上既有值再退 nRef；nSettle 有值＝權威，覆蓋
+        settle_val = q.get("settle") or hist.get(settle_date.isoformat()) or q["ref"]
+        hist[settle_date.isoformat()] = settle_val
+    else:
+        settle_date = day_d - timedelta(days=1)
+        while settle_date.weekday() >= 5:
+            settle_date -= timedelta(days=1)
+        # 🔴 盤中 nRef 可能過時（DX 實測 09:00：day 已滾新日、ref 還停在前前日結算）
+        # → 鏈上既有值（已收盤分支存的正式結算）優先，且**不覆蓋**既有值
+        settle_val = hist.get(settle_date.isoformat()) or q["ref"]
+        hist.setdefault(settle_date.isoformat(), settle_val)
+    return day_d, settle_date, settle_val
+
+
+def _chain_changes(key: str, code: str, q: dict | None, as_of: _date,
+                   entry: dict, series: str) -> dict:
+    """結算價累積法（雙合約鏈版）：日漲跌＝今結算/昨結算。
+
+    🔴 昨結一律「鏈 history 優先、nRef 只當 fallback」（2026-08-28 橡膠事故）：
+    SGX 收盤後把快照 nRef 改寫成非昨結的值（238.8；昨結實為 236.3），舊版已收盤
+    分支 settle/ref 直接相除算出 +0.08%（真值 +1.14%）。nRef 與鏈值不一致時印
+    warning——下次哪家交易所又改寫 nRef 要看得見。
     """
     def _null(reason: str) -> dict:
         return {"daily_pct": None, "weekly_pct": None, "series": series,
                 "resolve": f"結算價累積法：{reason} → 留空"}
 
-    if not q or not q.get("ref"):
-        return _null("快照未取得")
-    day = q["day"]
-    try:
-        day_d = _date(day // 10000, day // 100 % 100, day % 100)
-    except ValueError:
-        return _null(f"nTradingDay 異常（{day}）")
+    fed = _feed_chain(entry, code, q, as_of)
+    if fed is None:
+        day = (q or {}).get("day")
+        return _null("快照未取得" if not q or not q.get("ref")
+                     else f"nTradingDay 異常（{day}）")
+    day_d, settle_date, settle_val = fed
+    history: dict[str, float] = entry["chains"][code]["history"]
 
-    st = settle_state.setdefault(key, {})
-    prev_code = st.get("code")
-    history: dict[str, float] = st.get("history", {}) if prev_code == code else {}
+    # 昨結：鏈上 < settle_date 最近一筆、gap ≤ 4 日曆天（週末/連假容忍，沿用原規則）
+    prev_v: float | None = None
+    prev_src = "無"
+    prev_dates = sorted(d for d in (_date.fromisoformat(x) for x in history)
+                        if d < settle_date)
+    if prev_dates:
+        prev_d = prev_dates[-1]
+        v = history[prev_d.isoformat()]
+        if 1 <= (settle_date - prev_d).days <= 4 and v:
+            prev_v, prev_src = v, f"鏈{prev_d}"
+    if day_d < as_of and q.get("ref"):
+        # 已收盤快照自帶 ref（名義上=昨結）：只在鏈缺該日時 fallback
+        if prev_v is None:
+            if q.get("settle") and abs(q["ref"] - q["settle"]) < 1e-9:
+                # 🔴 ref==settle＝「收盤後 nRef 被改寫成當日結算」簽名（NYM/CME 09:00
+                # 實測 HO/HG/PA/ALI/CL 全中招）→ 昨結不可得，寧可鏈未接上退最後成交鏈，
+                # 也不出 settle/ref=+0.00% 假值
+                prev_src = "nRef 已被改寫（=settle），棄用"
+            else:
+                prev_v, prev_src = q["ref"], "nRef(fallback)"
+        elif abs(q["ref"] - prev_v) > 1e-9:
+            print(f"   ⚠️ {key}: 快照 nRef({q['ref']}) ≠ 鏈上昨結({prev_v})——"
+                  "交易所收盤後改寫 nRef？沿用鏈值（SGX 橡膠 2026-08-28 模式）")
 
-    if day_d < as_of:
-        # 已收盤：settle=該日結算、ref=前一交易日結算 → 直接可算
-        daily = (q["settle"] / q["ref"] - 1) * 100 if (q.get("settle") and q["ref"]) else None
-        settle_date, settle_val = day_d, q.get("settle") or q["ref"]
-        mode = f"已收盤：settle({q.get('settle')})/ref({q['ref']})"
-    else:
-        # 盤中：ref=settle(前一交易日)。與上一筆存檔（必須是前一交易日的 run）相除。
-        settle_date = day_d - timedelta(days=1)
-        while settle_date.weekday() >= 5:
-            settle_date -= timedelta(days=1)
-        settle_val = q["ref"]
-        daily = None
-        prev_dates = sorted(_date.fromisoformat(d) for d in history if _date.fromisoformat(d) < settle_date)
-        if prev_dates:
-            prev_d = prev_dates[-1]
-            gap = (settle_date - prev_d).days
-            prev_v = history[prev_d.isoformat()]
-            if 1 <= gap <= 4 and prev_v:
-                daily = (settle_val / prev_v - 1) * 100
-        mode = f"盤中：昨結=nRef({settle_val})、前結=狀態檔"
+    daily = (settle_val / prev_v - 1) * 100 if prev_v else None
+    mode = (f"已收盤：settle({q.get('settle')})/昨結[{prev_src}]" if day_d < as_of
+            else f"盤中：昨結=nRef({settle_val})、前結[{prev_src}]")
 
-    history[settle_date.isoformat()] = settle_val
     # 週漲跌：最近的「≤ settle_date-7」歷史結算
     weekly = None
     week_ago = settle_date - timedelta(days=7)
@@ -396,25 +486,32 @@ def _settle_chain_changes(key: str, code: str, q: dict | None, as_of: _date,
             base = history[d.isoformat()]
             weekly = (settle_val / base - 1) * 100 if base else None
             break
-    # 修剪 30 天外的舊值、更新狀態
-    history = {d: v for d, v in history.items()
-               if (as_of - _date.fromisoformat(d)).days <= 30}
-    settle_state[key] = {"code": code, "history": history,
-                        "updated": datetime.now().isoformat(timespec="seconds")}
 
     if daily is None:
         return {**_null(f"鏈尚未接上（{mode}；已存 {settle_date} 結算 {settle_val}，"
                         "明日起有值）"), "last_date": settle_date.isoformat()}
     return {
         "series": series, "resolve": f"結算價累積法（{mode}）",
-        "daily_pct": round(daily, 4), "weekly_pct": round(weekly, 4) if weekly is not None else None,
+        "daily_pct": round(daily, 4),
+        "weekly_pct": round(weekly, 4) if weekly is not None else None,
         "last_date": settle_date.isoformat(), "last_close": settle_val,
         "prev_date": "結算鏈", "prev_close": None,
     }
 
 
-def _parse_kline_rows(rows: list[str]) -> dict[_date, float]:
-    closes: dict[_date, float] = {}
+def _prune_entry(entry: dict, keep_codes: set[str], as_of: _date) -> None:
+    """修剪：已到期/不再追蹤的合約鏈整條刪；各鏈 30 天外舊值刪。"""
+    entry["chains"] = {c: ch for c, ch in entry.get("chains", {}).items()
+                       if c in keep_codes}
+    for ch in entry["chains"].values():
+        ch["history"] = {d: v for d, v in ch["history"].items()
+                         if (as_of - _date.fromisoformat(d)).days <= 30}
+
+
+def _parse_kline_bars(rows: list[str]) -> dict[_date, dict]:
+    """日K 列 → {date: {close, volume}}。格式 `YYYY/MM/DD, O, H, L, C[, VOLUME]`
+    （parts[5]＝成交量，A0 實證；缺欄＝None，滾月判準視同不可比）。"""
+    bars: dict[_date, dict] = {}
     for row in rows:
         parts = [p.strip() for p in row.split(",")]
         if len(parts) < 5:
@@ -426,8 +523,19 @@ def _parse_kline_rows(rows: list[str]) -> dict[_date, float]:
             close = float(parts[4])
         except ValueError:
             continue
-        closes[_date(int(m.group(1)), int(m.group(2)), int(m.group(3)))] = close
-    return closes
+        volume: float | None = None
+        if len(parts) >= 6:
+            try:
+                volume = float(parts[5])
+            except ValueError:
+                volume = None
+        bars[_date(int(m.group(1)), int(m.group(2)), int(m.group(3)))] = {
+            "close": close, "volume": volume}
+    return bars
+
+
+def _parse_kline_rows(rows: list[str]) -> dict[_date, float]:
+    return {d: b["close"] for d, b in _parse_kline_bars(rows).items()}
 
 
 def main() -> int:
@@ -488,16 +596,37 @@ def main() -> int:
         # 🔴 解析失敗＝進 resolve_failed → 輸出「明確 null」（報告留空）。
         # user 拍板（2026-08-26）：日報價格**只用群益**——群益拿不到就留空，
         # 絕不讓 scraper 因缺 key 而 fallback 回 yfinance 期貨路徑。
-        plan: dict[str, tuple[str, str, str]] = {}   # key -> (exch, code, 說明)
-        resolve_failed: dict[str, str] = {}          # key -> 原因
-        for key, (exch, hot) in FUTURES_HOT.items():
-            code = _hot_mapped_code(catalog, hot)
-            if code and code in catalog:
-                plan[key] = (exch, code, f"HOT {hot} → {code}")
-            else:
-                resolve_failed[key] = (f"HOT {hot} 映射失敗"
-                                       f"（order_code={catalog.get(hot, {}).get('order_code')}）")
+        # 🔴 最活絡月自動換月（2026-08-28 規劃）：HOT 換月落後市場慣例（橘子汁：市場
+        # 08-24 已移倉 Nov、HOT 08-28 仍指 Sep）→ 候選=LTD 排序近月+次月、錨取
+        # state active / HOT 映射較晚者（單向不回滾）、切換由成交量判準（_should_roll）。
+        settle_state = _load_settle_state()
+        for k in list(settle_state):
+            settle_state[k] = _migrate_settle_entry(settle_state[k])
+
+        plan: dict[str, tuple[str, str, str]] = {}          # key -> (exch, 近月code, 說明)
+        candidates: dict[str, tuple[str, str | None]] = {}  # key -> (近月, 次月)
+        resolve_failed: dict[str, str] = {}                 # key -> 原因
+
+        def _resolve_months(key: str, exch: str, quote_root: str, hot: str | None) -> None:
+            months = _month_codes(catalog, quote_root, as_of)
+            if not months:
+                resolve_failed[key] = f"{quote_root} 無可用月份（LTD ≥ as_of+3）"
                 print(f"   ⚠️ {key}: {resolve_failed[key]}")
+                return
+            hot_mapped = _hot_mapped_code(catalog, hot) if hot else None
+            if hot and not hot_mapped:
+                print(f"   ⚠️ {key}: HOT {hot} 映射失敗"
+                      f"（order_code={catalog.get(hot, {}).get('order_code')}）→ 改用 LTD 近月")
+            prev_active = settle_state.get(key, {}).get("active_code")
+            front, nxt = _pick_candidates(months, [prev_active, hot_mapped])
+            hot_tag = f"HOT {hot}→{hot_mapped or '?'} " if hot else ""
+            plan[key] = (exch, front, f"{hot_tag}候選 {front}/{nxt or '—'}")
+            candidates[key] = (front, nxt)
+
+        for key, (exch, hot) in FUTURES_HOT.items():
+            _resolve_months(key, exch, hot[:-4], hot)
+        for key, (exch, root) in SETTLE_CHAIN.items():
+            _resolve_months(key, exch, root, None)
         for key, (exch, code) in SPOT.items():
             if code in catalog:
                 plan[key] = (exch, code, "spot")
@@ -511,45 +640,63 @@ def main() -> int:
             else:
                 resolve_failed[key] = f"{exch},{code} 不在商品檔"
                 print(f"   ⚠️ {key}: {resolve_failed[key]}")
-        chain_plan: dict[str, tuple[str, str]] = {}
-        for key, (exch, root) in SETTLE_CHAIN.items():
-            code = _chain_front_contract(catalog, root, as_of)
-            if code:
-                chain_plan[key] = (exch, code)
-            else:
-                resolve_failed[key] = f"{root} 無可用月份（SETTLE_CHAIN）"
-                print(f"   ⚠️ {key}: {resolve_failed[key]}")
 
         # 快照訂閱（結算價鏈 + SPOT_INDEX 混合法都要）：
         # 🔴 user 拍板（2026-08-26 第五輪）：**全期貨改結算價鏈**——每檔期貨的快照 nRef
         # ＝正式結算價，逐日存狀態檔；鏈未接上（冷啟動/換約日）退回同合約最後成交鏈
         # 並在 resolve 註明。FX 現貨無結算概念（nRef=NY 17:00 昨收＝KLine 同口徑）維持
         # KLine；SPOT_INDEX 維持混合法（現貨收盤口徑）。
-        futures_keys = {k for k in plan if k in FUTURES_HOT}
-        snap_codes = {c for k, (_e, c, _n) in plan.items() if k in futures_keys}
-        snap_codes |= {c for _e, c in spot_index_plan.values()}
-        snap_codes |= {c for _e, c in chain_plan.values()}
+        # 近月＋次月**都訂**（兩條鏈平常一起養，切換日無縫——任務 3）。
+        settle_keys = {k for k in plan if k in FUTURES_HOT or k in SETTLE_CHAIN}
+        snap_codes: set[str] = set()
+        code2exch: dict[str, str] = {}
+        for k in settle_keys:
+            for c in candidates[k]:
+                if c:
+                    snap_codes.add(c)
+                    code2exch[c] = plan[k][0]
+        for _e, c in spot_index_plan.values():
+            snap_codes.add(c)
+            code2exch[c] = _e
         if snap_codes:
-            code2exch = {c: e for k, (e, c, _n) in plan.items()}
-            code2exch.update({c: e for e, c in spot_index_plan.values()})
-            code2exch.update({c: e for e, c in chain_plan.values()})
-            nos = "#".join(f"{code2exch[c]},{c}" for c in sorted(snap_codes))
-            page, rc = os_lib.SKOSQuoteLib_RequestStocks(-1, nos)
-            print(f"📸 快照訂閱 {len(snap_codes)} 檔 rc={rc} page={page}")
-            t0 = time.time()
-            while time.time() - t0 < 15 and not snap_codes <= set(state.quotes):
-                pump(0.5)
+            codes_sorted = sorted(snap_codes)
+            # 🔴 SKOS 快照頁數有限：第 2 次 RequestStocks(-1) 回 3006
+            # SK_SUBJECT_QUOTE_PAGE_EXCEED（2026-08-28 實測，67 檔雙合約後超過單頁）。
+            # → 同一頁「覆蓋式輪換」：每批訂完等快照全到（存進 state.quotes 後不受
+            #   換頁影響），再用**同一頁**訂下一批（RequestStocks 同頁＝整頁替換）。
+            page_no = -1   # 首批自動配號，之後重用該頁
+            for i in range(0, len(codes_sorted), 40):
+                batch = codes_sorted[i:i + 40]
+                nos = "#".join(f"{code2exch[c]},{c}" for c in batch)
+                page, rc = os_lib.SKOSQuoteLib_RequestStocks(page_no, nos)
+                print(f"📸 快照訂閱 batch{i // 40 + 1} {len(batch)} 檔 rc={rc} page={page}")
+                if rc == 0 and int(page) >= 0:
+                    page_no = int(page)
+                want = set(batch)
+                t0 = time.time()
+                while time.time() - t0 < 15 and not want <= set(state.quotes):
+                    pump(0.5)
             missing = snap_codes - set(state.quotes)
             print(f"   快照到位 {len(snap_codes) - len(missing)}/{len(snap_codes)}"
                   + (f"，未到：{sorted(missing)}" if missing else ""))
 
-        print(f"📈 逐檔抓日K（{len(plan) + len(spot_index_plan)} 檔）…")
         start_d = (as_of - timedelta(days=args.days)).strftime("%Y%m%d")
         end_d = as_of.strftime("%Y%m%d")
-        kline_targets = dict(plan)
+        kline_items: list[tuple[str, str, str, str]] = []   # (顯示名, exch, code, note)
+        seen_kline: set[str] = set()
+        for key, (exch, front, note) in plan.items():
+            if key in settle_keys:
+                front_c, nxt_c = candidates[key]
+                for c, tag in ((front_c, "近月"), (nxt_c, "次月")):
+                    if c and c not in seen_kline:
+                        seen_kline.add(c)
+                        kline_items.append((f"{key}:{tag}", exch, c, note))
+            else:
+                kline_items.append((key, exch, front, note))
         for key, (exch, code) in spot_index_plan.items():
-            kline_targets[key] = (exch, code, "spot_index(週基準/前日收)")
-        for key, (exch, code, note) in kline_targets.items():
+            kline_items.append((key, exch, code, "spot_index(週基準/前日收)"))
+        print(f"📈 逐檔抓日K（{len(kline_items)} 檔）…")
+        for label, exch, code, note in kline_items:
             rc = os_lib.SKOSQuoteLib_RequestKLineByDate(f"{exch},{code}", 1, start_d, end_d, 1)
             t0 = time.time()
             # 等這一檔的資料到齊（idle 2s）再抓下一檔，避免事件交錯時難定位缺漏
@@ -558,19 +705,39 @@ def main() -> int:
                 if code in state.kline and state.kline_last_ts and time.time() - state.kline_last_ts > 2:
                     break
             n = len(state.kline.get(code, []))
-            print(f"   {key:<14} {exch},{code:<9} rc={rc} rows={n}  ({note})")
+            print(f"   {label:<18} {exch},{code:<9} rc={rc} rows={n}  ({note})")
 
         prices: dict[str, dict] = {}
         problems: list[str] = []
-        settle_state = _load_settle_state()
-        for key, (exch, code, note) in plan.items():
-            series = f"{exch},{code}"
-            closes = _parse_kline_rows(state.kline.get(code, []))
-            cc = _changes_from_closes(closes, as_of)   # 同合約最後成交鏈（fallback/週過渡）
+        roll_events: list[str] = []
+        for key, (exch, front, note) in plan.items():
+            if key in settle_keys:
+                front_c, nxt_c = candidates[key]
+                front_bars = _parse_kline_bars(state.kline.get(front_c, []))
+                next_bars = _parse_kline_bars(state.kline.get(nxt_c, [])) if nxt_c else {}
+                rolled = bool(nxt_c) and _should_roll(front_bars, next_bars, as_of)
+                active = nxt_c if rolled else front_c
+                entry = settle_state.setdefault(key, {"active_code": None, "chains": {}})
+                prev_active = entry.get("active_code")
+                roll_note = ""
+                if prev_active and active != prev_active:
+                    kind = "量判" if rolled else "LTD/錨"
+                    roll_note = f"；滾月({kind}) {prev_active}→{active}"
+                    roll_events.append(f"{key}: {prev_active}→{active}（{kind}）")
+                    print(f"   🔁 {key}: 滾月({kind}) {prev_active}→{active}")
+                # 非 active 的候選也餵鏈（兩條鏈平常一起養，切換日昨結已在鏈上＝無縫）
+                for c in {front_c, nxt_c} - {None, active}:
+                    _feed_chain(entry, c, state.quotes.get(c), as_of)
+                series = f"{exch},{active}"
+                se = _chain_changes(key, active, state.quotes.get(active), as_of,
+                                    entry, series)
+                entry["active_code"] = active
+                _prune_entry(entry, {c for c in (front_c, nxt_c) if c}, as_of)
+                entry["updated"] = datetime.now().isoformat(timespec="seconds")
 
-            if key in futures_keys:
-                se = _settle_chain_changes(key, code, state.quotes.get(code), as_of,
-                                           settle_state, series)
+                active_bars = next_bars if rolled else front_bars
+                closes = {d: b["close"] for d, b in active_bars.items()}
+                cc = _changes_from_closes(closes, as_of)   # 同合約最後成交鏈（fallback/週過渡）
                 if se["daily_pct"] is not None:
                     # 結算鏈為主；週漲跌：結算歷史滿 7 天前用最後成交鏈過渡
                     weekly = se["weekly_pct"]
@@ -580,27 +747,31 @@ def main() -> int:
                         wk_src = "最後成交鏈(過渡)"
                     prices[key] = {
                         "series": series,
-                        "resolve": f"{note}；日=結算鏈、週={wk_src}",
+                        "resolve": f"{note}{roll_note}；日=結算鏈、週={wk_src}",
                         "daily_pct": se["daily_pct"], "weekly_pct": weekly,
                         "last_date": se["last_date"], "last_close": se["last_close"],
                         "prev_date": "結算鏈", "prev_close": None,
                     }
                     continue
-                # 鏈未接上（冷啟動/換約日）→ 同合約最後成交鏈 fallback（resolve 註明）
-                if cc is not None:
+                # 鏈未接上（冷啟動/換約日）→ 同合約最後成交鏈 fallback（resolve 註明）。
+                # SETTLE_CHAIN（極薄合約）例外：最後成交序列是雜訊，不退、直接留空。
+                if key not in SETTLE_CHAIN and cc is not None:
                     prices[key] = {
                         "series": series,
-                        "resolve": f"{note}；結算鏈未接上（{se['resolve'][:60]}）"
+                        "resolve": f"{note}{roll_note}；結算鏈未接上（{se['resolve'][:60]}）"
                                    "→ 本日用同合約最後成交鏈",
                         **cc,
                     }
                     continue
-                problems.append(f"{key}（{series}：結算鏈未接上且 bar 不足）")
+                problems.append(f"{key}（{series}：{se['resolve'][:80]}）")
                 prices[key] = {"daily_pct": None, "weekly_pct": None, "series": series,
-                               "resolve": f"{note}；結算鏈未接上且 bar 不足 → 留空"}
+                               "resolve": f"{note}{roll_note}；{se['resolve']}"}
                 continue
 
             # FX 現貨：維持 KLine 最後成交鏈（nRef=NY 17:00 昨收，同口徑）
+            series = f"{exch},{front}"
+            closes = _parse_kline_rows(state.kline.get(front, []))
+            cc = _changes_from_closes(closes, as_of)
             if cc is None:
                 problems.append(f"{key}（{series}：bar 不足或過期）")
                 prices[key] = {
@@ -612,12 +783,6 @@ def main() -> int:
         for key, (exch, code) in spot_index_plan.items():
             closes = _parse_kline_rows(state.kline.get(code, []))
             entry = _hybrid_index_changes(state.quotes.get(code), closes, as_of, f"{exch},{code}")
-            if entry["daily_pct"] is None:
-                problems.append(f"{key}（{entry['resolve']}）")
-            prices[key] = entry
-        for key, (exch, code) in chain_plan.items():
-            entry = _settle_chain_changes(key, code, state.quotes.get(code), as_of,
-                                          settle_state, f"{exch},{code}")
             if entry["daily_pct"] is None:
                 problems.append(f"{key}（{entry['resolve']}）")
             prices[key] = entry
@@ -634,8 +799,8 @@ def main() -> int:
             "version": 1,
             "as_of": as_of.isoformat(),
             "generated_at": datetime.now().isoformat(timespec="seconds"),
-            "source": "capital-api SKOSQuoteLib dump_bfw_price_changes（映射合約自身日K；"
-                      "close=最後成交非結算）",
+            "source": "capital-api SKOSQuoteLib dump_bfw_price_changes（結算價鏈＋"
+                      "最活絡月量判滾月；合約自身序列，絕不用 HOT 拼接）",
             "uncovered_fallback": list(UNCOVERED),
             "prices": prices,
         }
@@ -651,6 +816,8 @@ def main() -> int:
                       f"{e.get('prev_date')}→{e['last_date']} {e.get('prev_close')}→{e.get('last_close')}")
             else:
                 print(f"  {key:<14} 日 {d:>8} 週 {w:>8}  （留空：{e['resolve']}）")
+        if roll_events:
+            print(f"  🔁 滾月：{roll_events}")
         if problems:
             print(f"  ⚠️ 失敗：{problems}")
         print(f"  （fallback 給 scraper 既有路徑：{UNCOVERED}）")
