@@ -26,6 +26,9 @@ classifiers = [
 ]
 dependencies = [
     "comtypes>=1.2.0",
+    # pywin32（pythoncom）為海外選擇權即時串流「必需」：comtypes.PumpEvents 不會推送
+    # SKOOQuoteLib 報價事件（OnNotifyQuoteLONG），只有 pythoncom.PumpWaitingMessages 會。
+    "pywin32>=306",
     "python-dotenv>=1.0.0",
 ]
 

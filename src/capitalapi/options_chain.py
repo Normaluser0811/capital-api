@@ -61,7 +61,20 @@ class OptionQuote:
     trading_day: int = 0           # 交易日 (YYYYMMDD)
 
     # 小數位數
-    decimal_places: int = 2        # 報價小數位數
+    decimal_places: int = 2        # 報價小數位數 (sDecimal；解碼 price = raw / 10^decimal_places)
+    denominator: int = 1           # nDenominator (美債 32 分數制可能 != 1)
+
+    # 原始整數值（忠於 SKFOREIGNLONG，供下游 raw 層忠實入庫；不可變鐵律＝raw 存整數）
+    # 解碼留消費端：price = raw_* / 10^decimal_places（raw_strike 不除，已是最終單位）
+    raw_open: int = 0
+    raw_high: int = 0
+    raw_low: int = 0
+    raw_close: int = 0
+    raw_settle: int = 0
+    raw_ref: int = 0
+    raw_bid: int = 0
+    raw_ask: int = 0
+    raw_strike: int = 0            # nStrikePrice 原始整數（不除）
 
     @property
     def mid_price(self) -> float:

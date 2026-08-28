@@ -20,6 +20,60 @@ from .skcom import create_oo_quote_lib, get_sk_module
 logger = logging.getLogger(__name__)
 
 
+def build_option_quote(stock) -> OptionQuote:
+    """從 SKFOREIGNLONG 結構建 OptionQuote（純函式、可單測、不碰 COM）。
+
+    `raw_*` 欄存原始整數（忠實 raw 層、不可變鐵律）；解碼便利值 = raw / 10^decimal_places，
+    `strike` 不除（已是最終單位、與解碼後報價同單位）。
+
+    三個解碼正確性要點（修自舊版 inline bug）：
+    - `sDecimal` 可為 0（HSI/JNI divisor=1），不可硬塞 2。
+    - 履約價 `nStrikePrice` 不除 divisor。
+    - 保留 `nDenominator`（美債 32 分數制可能 != 1）。
+    """
+    decimal = int(stock.sDecimal) if stock.sDecimal >= 0 else 0
+    divisor = 10 ** decimal
+
+    call_put = str(stock.bstrCallPut).upper()
+    option_type = OptionType.CALL if call_put == "C" else OptionType.PUT
+
+    return OptionQuote(
+        symbol=stock.bstrStockNo,
+        name=stock.bstrStockName,
+        option_type=option_type,
+        strike_price=float(stock.nStrikePrice),
+        decimal_places=decimal,
+        denominator=int(stock.nDenominator),
+        # 價格（解碼後便利值；忠實 raw 整數見 raw_* 欄）
+        close_price=stock.nClose / divisor,
+        open_price=stock.nOpen / divisor,
+        high_price=stock.nHigh / divisor,
+        low_price=stock.nLow / divisor,
+        ref_price=stock.nRef / divisor,
+        settle_price=stock.nSettlePrice / divisor,
+        bid_price=stock.nBid / divisor,
+        bid_qty=stock.nBc,
+        ask_price=stock.nAsk / divisor,
+        ask_qty=stock.nAc,
+        volume=stock.nTQty,
+        tick_qty=stock.nTickQty,
+        market_no=stock.bstrMarketNo,
+        exchange_no=stock.bstrExchangeNo,
+        exchange_name=stock.bstrExchangeName,
+        trading_day=stock.nTradingDay,
+        # 原始整數（供 raw 層忠實入庫，免受解碼影響）
+        raw_open=int(stock.nOpen),
+        raw_high=int(stock.nHigh),
+        raw_low=int(stock.nLow),
+        raw_close=int(stock.nClose),
+        raw_settle=int(stock.nSettlePrice),
+        raw_ref=int(stock.nRef),
+        raw_bid=int(stock.nBid),
+        raw_ask=int(stock.nAsk),
+        raw_strike=int(stock.nStrikePrice),
+    )
+
+
 @dataclass
 class OptionsQuoteManager:
     """
@@ -55,8 +109,8 @@ class OptionsQuoteManager:
     # 選擇權鏈快取
     _chains: Dict[str, OptionsChain] = field(default_factory=dict, init=False, repr=False)
 
-    # 報價頁面編號 (群益 API 需要)
-    _page_no: int = field(default=0, init=False, repr=False)
+    # 報價頁面編號（群益 API：psPageNo 官方固定帶 1；page 0 不推送報價）
+    _page_no: int = field(default=1, init=False, repr=False)
 
     # 報價回調
     on_quote: Callable[[OptionQuote], None] | None = field(
@@ -104,41 +158,7 @@ class OptionsQuoteManager:
                         index, stock
                     )
 
-                    # 解析小數位數
-                    decimal = stock.sDecimal if stock.sDecimal > 0 else 2
-                    divisor = 10 ** decimal
-
-                    # 判斷 Call/Put
-                    call_put = str(stock.bstrCallPut).upper()
-                    option_type = OptionType.CALL if call_put == "C" else OptionType.PUT
-
-                    quote = OptionQuote(
-                        symbol=stock.bstrStockNo,
-                        name=stock.bstrStockName,
-                        option_type=option_type,
-                        strike_price=stock.nStrikePrice / divisor,
-                        decimal_places=decimal,
-                        # 價格
-                        close_price=stock.nClose / divisor,
-                        open_price=stock.nOpen / divisor,
-                        high_price=stock.nHigh / divisor,
-                        low_price=stock.nLow / divisor,
-                        ref_price=stock.nRef / divisor,
-                        settle_price=stock.nSettlePrice / divisor,
-                        # 買賣報價
-                        bid_price=stock.nBid / divisor,
-                        bid_qty=stock.nBc,
-                        ask_price=stock.nAsk / divisor,
-                        ask_qty=stock.nAc,
-                        # 成交
-                        volume=stock.nTQty,
-                        tick_qty=stock.nTickQty,
-                        # 交易所資訊
-                        market_no=stock.bstrMarketNo,
-                        exchange_no=stock.bstrExchangeNo,
-                        exchange_name=stock.bstrExchangeName,
-                        trading_day=stock.nTradingDay,
-                    )
+                    quote = build_option_quote(stock)
 
                     # 更新選擇權鏈快取
                     manager._update_chain(quote)
@@ -149,36 +169,30 @@ class OptionsQuoteManager:
                 except Exception as e:
                     logger.error(f"處理選擇權報價時發生錯誤: {e}")
 
-            def OnNotifyTicksLONG(self, index, ptr, date, time, close, qty):
-                """逐筆成交回調"""
-                # 可以擴充處理逐筆成交
+            def OnNotifyTicksLONG(self, *args):
+                """逐筆成交回調。
+
+                ⚠ 必須用 *args：固定參數簽章會破壞 comtypes 對 SK 事件介面的
+                vtable 事件接收器建構，導致其後的事件（OnNotifyQuoteLONG）靜默不觸發
+                （OnConnect/OnProducts 在前面 slot 仍會收到，故症狀為「有商品清單、無報價」）。
+                """
                 pass
 
-            def OnNotifyBest5LONG(
-                self, index,
-                bid1, bidq1, bid2, bidq2, bid3, bidq3, bid4, bidq4, bid5, bidq5,
-                ask1, askq1, ask2, askq2, ask3, askq3, ask4, askq4, ask5, askq5
-            ):
-                """五檔報價回調"""
+            def OnNotifyBest5LONG(self, *args):
+                """五檔報價回調（*args；index 為首參，其後 10 對 bid/qty + 10 對 ask/qty）。"""
+                if not manager.on_best5:
+                    return
                 try:
-                    best5 = {
-                        "bids": [
-                            (bid1/100, bidq1), (bid2/100, bidq2), (bid3/100, bidq3),
-                            (bid4/100, bidq4), (bid5/100, bidq5)
-                        ],
-                        "asks": [
-                            (ask1/100, askq1), (ask2/100, askq2), (ask3/100, askq3),
-                            (ask4/100, askq4), (ask5/100, askq5)
-                        ]
-                    }
-                    if manager.on_best5:
-                        manager.on_best5(str(index), best5)
-                except Exception as e:
+                    idx = args[0]
+                    nums = args[1:21]
+                    bids = [(nums[i] / 100, nums[i + 1]) for i in range(0, 10, 2)]
+                    asks = [(nums[i] / 100, nums[i + 1]) for i in range(10, 20, 2)]
+                    manager.on_best5(str(idx), {"bids": bids, "asks": asks})
+                except Exception as e:  # noqa: BLE001
                     logger.error(f"處理五檔報價時發生錯誤: {e}")
 
             def OnNotifyBest10LONG(self, *args):
                 """十檔報價回調"""
-                # 可以擴充處理十檔報價
                 pass
 
         self._oo_quote_event = OOQuoteLibEvent()
@@ -260,10 +274,8 @@ class OptionsQuoteManager:
         if not self._connected:
             raise CapitalAPIError("請先連線到報價伺服器")
 
-        # SKOOQuoteLib_RequestStocks 需要 page 參數
-        self._page_no, code = self._oo_quote.SKOOQuoteLib_RequestStocks(
-            self._page_no, symbol
-        )
+        # 官方文件：psPageNo「固定帶 1」（page 0 rc=0 但不推送報價）
+        self._page_no, code = self._oo_quote.SKOOQuoteLib_RequestStocks(1, symbol)
         if code == 0:
             self._subscribed.add(symbol)
             logger.info(f"訂閱選擇權報價: {symbol}")
@@ -286,12 +298,10 @@ class OptionsQuoteManager:
         if not self._connected:
             raise CapitalAPIError("請先連線到報價伺服器")
 
-        # 用逗號分隔多檔商品
-        symbols_str = ",".join(symbols)
-        # SKOOQuoteLib_RequestStocks 需要 page 參數
-        self._page_no, code = self._oo_quote.SKOOQuoteLib_RequestStocks(
-            self._page_no, symbols_str
-        )
+        # 多檔以 "#" 區隔（每檔須為「交易所,代碼」；逗號併接會得 3023 商品代碼無效）
+        symbols_str = "#".join(symbols)
+        # 官方文件：psPageNo「固定帶 1」。page 0 會 rc=0 但**不推送報價**（OnNotifyQuoteLONG 不觸發）。
+        self._page_no, code = self._oo_quote.SKOOQuoteLib_RequestStocks(1, symbols_str)
 
         if code == 0:
             self._subscribed.update(symbols)
