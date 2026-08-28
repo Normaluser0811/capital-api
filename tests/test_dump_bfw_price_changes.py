@@ -303,6 +303,46 @@ class TestStateMigrationAndPrune:
         assert entry["chains"] == {}
 
 
+# ---------------------------------------------------------------- SPOT_INDEX 混合法守衛
+
+class TestHybridIndexNrefRollover:
+    """🔴 2026-08-28 06:31 事故：INDEX 頁收盤後把 nRef 滾成昨收（nClose==nRef），
+    未開盤分支昨收/前日收同值 → KOSPI/NI225 發布 +0.00% 假值（真值 +1.53%/-0.20%）。"""
+
+    KOSPI_CLOSES = {date(2026, 8, 25): 6742.74, date(2026, 8, 26): 6808.21,
+                    date(2026, 8, 27): 6912.37}
+
+    def test_kospi_rolled_nref_regression(self):
+        """nClose==nRef 簽名 → 前日收退日K 完成列（08-26），算出 +1.53% 非 0.00%。"""
+        q = {"close": 6912.37, "ref": 6912.37, "settle": 0, "day": 20260827}
+        out = dump._hybrid_index_changes(q, dict(self.KOSPI_CLOSES),
+                                         date(2026, 8, 28), "INDEX,KOSPI")
+        assert out["daily_pct"] == round((6912.37 / 6808.21 - 1) * 100, 4)
+        assert out["daily_pct"] != 0.0
+
+    def test_unrolled_nref_unchanged(self):
+        """ref ≠ close（HHHSI 06:31 常態）→ 原路徑：前日收=nRef。"""
+        closes = {date(2026, 8, 25): 25511.10, date(2026, 8, 26): 25652.97,
+                  date(2026, 8, 27): 25565.74}
+        q = {"close": 25565.74, "ref": 25652.97, "settle": 0, "day": 20260827}
+        out = dump._hybrid_index_changes(q, closes, date(2026, 8, 28), "INDEX,HHHSI")
+        assert out["daily_pct"] == round((25565.74 / 25652.97 - 1) * 100, 4)  # -0.34
+
+    def test_rolled_nref_without_kline_history_blank(self):
+        """簽名命中但日K 無更早完成列 → 留空，不出 0.00%。"""
+        q = {"close": 6912.37, "ref": 6912.37, "settle": 0, "day": 20260827}
+        out = dump._hybrid_index_changes(q, {date(2026, 8, 27): 6912.37},
+                                         date(2026, 8, 28), "INDEX,KOSPI")
+        assert out["daily_pct"] is None
+
+    def test_intraday_branch_unaffected(self):
+        """開盤中分支（day >= as_of）不受守衛影響：昨收=nRef、前日=日K。"""
+        q = {"close": 6900.0, "ref": 6912.37, "settle": 0, "day": 20260828}
+        out = dump._hybrid_index_changes(q, dict(self.KOSPI_CLOSES),
+                                         date(2026, 8, 28), "INDEX,KOSPI")
+        assert out["daily_pct"] == round((6912.37 / 6808.21 - 1) * 100, 4)
+
+
 # ---------------------------------------------------------------- KLine 解析（volume 擴充）
 
 class TestParseKline:
