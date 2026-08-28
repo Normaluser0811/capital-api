@@ -10,11 +10,22 @@
 > 計畫單一真相：`~/.claude/plans/bfw-daily-report-capital-price-and-commodity-expansion.md`（Part 1）；
 > 主交接：scraper/next_session_prompt.md §-1.0 ③。
 > **A0 結論全文：[docs/overseas_futures_spike_a0.md](docs/overseas_futures_spike_a0.md)**（五題全答，
-> 摘要見 TODO.md 最上節）。spike 工具：`scripts/spike_overseas_futures_a0.py`（可重跑）。
+> 摘要見 TODO.md）。spike 工具：`scripts/spike_overseas_futures_a0.py`（可重跑）。
 
-**分支結構（stacked，收尾要記得）**：`feat/overseas-futures-spike-a0` 疊在
-`feat/overseas-options-ingestion`（Part B 的分支，未併 main）上，因為交接文件與 pywin32
-依賴只存在於該分支。併版時先併父分支或兩支一起。
+## 🆕 2026-08-28：dump 三改造完成（橡膠 nRef 修復＋量判滾月＋雙合約鏈）已併 main
+
+> 詳見 TODO.md 最上節與計畫 `~/.claude/plans/bfw-price-dump-active-month-roll-and-rubber-nref-fix.md`。
+> **A1 設計必吸收的四條鐵律更新**：① nRef 收盤後改寫**不只 SGX**（NYM/CME 09:00 實測
+> `ref==settle` 全中招；06:30 生產時點 ref 才是真昨結）——昨結一律自家鏈 history 優先；
+> ② 盤中 nRef 可能過時（DX：day 已滾、ref 停前前日）——鏈上正式結算優先且不可被覆蓋；
+> ③ SKOS 快照**單頁上限**（第 2 頁 3006）——多批訂閱走同頁覆蓋式輪換；
+> ④ 報導合約＝最活絡月（成交量判準、單向），HOT 只當錨。
+> ⚠️ 任務 4（08-28 橡膠頁回修）未做，待 user 拍板。
+> ⚠️ 明晨 06:30 首跑：17 檔滾月首次在生產 state 觸發，盯 resolve/problems/warning。
+
+**分支結構**：~~stacked~~ **✅ 2026-08-28 已全部併回 main 並清理**（`feat/overseas-options-ingestion`
+→ `feat/overseas-futures-spike-a0` → `fix/bfw-settle-chain-roll` 三支依序併入，遠端分支已刪）。
+主工作樹（`D:\PythonProjects\capital-api`）停在 main＝排程 06:30 讀的生產碼，部署漂移已解。
 
 **A1（下個 session）要做的**：
 1. （2 分鐘前置）明晨 06:30 補跑 `--symbols "CBOT,C0000#CBOT,W0000#NYM,GC0000#ICEUS,KC0000"`
