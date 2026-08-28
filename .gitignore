@@ -56,3 +56,9 @@ comtypes/gen/
 
 # Phase 0 spike 自動產出（每次跑覆寫，不入庫）
 docs/overseas_options_field_survey.md
+
+# Phase A0 海期 spike 自動 capture（大量 dump，不入庫；結論在 docs/overseas_futures_spike_a0.md）
+docs/overseas_futures_spike_a0_capture_*.md
+
+# BFW 價格 dump 的狀態檔（結算價累積鏈，逐日更新）
+data/

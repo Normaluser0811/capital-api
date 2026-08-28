@@ -1,6 +1,48 @@
 # Capital API 待辦事項
 
-**最後更新**: 2026-06-16
+**最後更新**: 2026-08-26
+
+---
+
+## ✅ 海期價格源 Phase A0 盤中 spike 完成（2026-08-26，分支 `feat/overseas-futures-spike-a0`）
+
+> 背景＝BFW 日報要以群益取代 yfinance 當期貨價格源（計畫
+> `~/.claude/plans/bfw-daily-report-capital-price-and-commodity-expansion.md` Part 1；
+> 主交接在 scraper/next_session_prompt.md §-1.0 ③）。
+> **五題全數有答案，結論全文 → [docs/overseas_futures_spike_a0.md](docs/overseas_futures_spike_a0.md)**；
+> 工具 `scripts/spike_overseas_futures_a0.py`（可重跑）。摘要：
+
+1. **Q1** 線上商品檔 1,313 檔複驗：44 目標代碼 43 個在線；**鋁無 HOT**（只有逐月 ALI2608–2701，
+   A1 要自建近月選擇）。FX 現貨頁/INDEX 延遲頁與海期**同通道**可訂、可推播、可查 KLine。
+2. **Q2** 日K API 可用（`RequestKLineByDate`，HOT/逐月/FX/INDEX 都吃）。
+   🔴 **HOT 的 KLine 是換月拼接**（KC0000 的 08-12 列＝KC2609、08-25 列＝KC2612，逐欄位驗證）
+   ——與 yfinance 同構的雷。**週漲跌必須抓「映射合約自身」的 KLine**。
+3. **Q3** `nRef`＝該 `nTradingDay` 的昨結（正式結算價）；已收盤市場 `nSettlePrice/nRef` 直接
+   得已完成日漲跌；KLine 收盤欄＝最後成交**非結算**。⚠️ 穀物在 06:30（兩盤之間）的欄位
+   狀態未實測，A1 開工前明晨 06:30 補跑一次 `--symbols`。
+4. **Q4** HOT 映射雙重可解：detail 下單代碼 `{root}_{YYYYMM}` 明示映射 + HOT 名自帶月份；
+   `C0000`≡`C2609` 訂閱逐欄位驗證。
+5. **Q5** 同 ID 兩行程 API 併發登入**不互踢**（A 全程 IsConnected=1）。維護窗手冊無記載，
+   留 A2 排程試跑觀察。
+6. 雜項：`nClose=0`＝本節尚無成交哨兵要 guard；訂閱含無效代碼**整批**被拒（3023）；
+   TY 32 分數制 API 已解成十進位（dec=6）。
+
+**同日午前追加（user 指示日報改群益價，已實戰上線一次；隨後拍板**常態只用群益**）**：
+`scripts/dump_bfw_price_changes.py` 產價格檔 → scraper `daily-report --price-file` 消費，
+08-26 全部 43 頁刪除重生成完成。scraper 端已把 dump 接成 `--apply` 的**自動前置步驟**
+（scraper merge `95cbd48`；本腳本從此每天 06:30 被排程叫起，改動要顧向後相容：
+`--date`/`--out` 介面、exit code 語意、期貨/FX 失敗＝明確 null）。
+實戰又揭兩雷（已寫進 dump 註解）：① **INDEX 頁日K 不可信作昨收**（KOSPI 最後一根是
+「今天盤中值掛昨天日期」，歷史列與 DB 全等唯最後一根不等）→ 指數剔除、走 scraper DB
+fallback；② **極薄合約（COMEX 鋁）最後成交序列是垃圾**（ALI2608 零成交＝結算順延平 bar
+→ 日漲跌算成前一天的；ALI2609 最後成交離結算 2.7%）→ EXPLICIT_NULL 留空。
+主交接 → scraper/next_session_prompt.md §-1.0b。
+
+**🔜 下一步＝Phase A1**：capital-api 補海期 SKOSQuoteLib 封裝（純 library，比照海選
+`options_quote.py` 模式；API 面清單見結論文件 §「對 Phase A1/A2 的直接輸入」）。
+A1 設計要吸收上面兩雷（KLine 週漲跌 API 面應內建「指數頁禁用/薄合約偵測」守衛）。
+⚠️ 本分支疊在 `feat/overseas-options-ingestion` 上（該分支 6 月完工、push 過但**尚未併 main**，
+交接文件只存在於該分支）——併版時兩支一起處理，或先併父分支再併本支。
 
 ---
 

@@ -1,4 +1,39 @@
-# 交接：群益海外選擇權 → PostgreSQL → Excel (Black-76 + Greeks)
+# 交接：capital-api（兩條線）
+
+> ⚠️ 本檔含兩份交接：**Part A｜海期價格源（2026-08-26 起，進行中）** 與
+> **Part B｜海外選擇權（2026-06-16 完工待併版）**。不要擇一刪除。
+
+---
+
+# Part A｜海期價格源（BFW 日報群益化）— Phase A0 ✅ 完成，下一步 A1
+
+> 計畫單一真相：`~/.claude/plans/bfw-daily-report-capital-price-and-commodity-expansion.md`（Part 1）；
+> 主交接：scraper/next_session_prompt.md §-1.0 ③。
+> **A0 結論全文：[docs/overseas_futures_spike_a0.md](docs/overseas_futures_spike_a0.md)**（五題全答，
+> 摘要見 TODO.md 最上節）。spike 工具：`scripts/spike_overseas_futures_a0.py`（可重跑）。
+
+**分支結構（stacked，收尾要記得）**：`feat/overseas-futures-spike-a0` 疊在
+`feat/overseas-options-ingestion`（Part B 的分支，未併 main）上，因為交接文件與 pywin32
+依賴只存在於該分支。併版時先併父分支或兩支一起。
+
+**A1（下個 session）要做的**：
+1. （2 分鐘前置）明晨 06:30 補跑 `--symbols "CBOT,C0000#CBOT,W0000#NYM,GC0000#ICEUS,KC0000"`
+   實測穀物在兩盤之間的 `nTradingDay`/`nRef` 狀態（A0 唯一未實測的時點）。
+2. `src/capitalapi/` 新增海期報價封裝（比照海選 `options_quote.py`）：
+   EnterMonitorLONG / RequestOverseaProducts + GetOverseaProductDetail(1)（**含 HOT 映射解析**
+   `{root}_{YYYYMM}`）/ RequestStocks(-1, "exch,code#…") / GetStockByNo·IndexLONG /
+   RequestKLineByDate / LeaveMonitor；`SKFOREIGNLONG` 原始整數 + sDecimal 全欄保留。
+3. 鐵律：🔴 HOT KLine 是換月拼接，週漲跌只能用**映射合約自身** KLine；日漲跌用快照
+   `nClose/nRef`（同合約＋正式結算）；`nClose=0`＝無成交哨兵；訂閱清單先過線上商品檔
+   （含無效代碼整批 3023）；報價事件只有 pythoncom 泵得到。
+4. A2（capital-api 之後）：pgdb 純新增表 `raw_quotes.overseas_future_daily`（PK (symbol,
+   trade_date)、原始整數 + decimal_places + `hot_contract` 欄）+ macrodata collector 06:00 job
+   （⚠️ scheduler repo 在指派範圍外，屆時請 user 展延授權）；A3 雙源並跑 ≥5 交易日、
+   彭博信件當異源 oracle 後才切主。
+
+---
+
+# Part B｜群益海外選擇權 → PostgreSQL → Excel (Black-76 + Greeks)
 
 > **狀態（2026-06-16）**：**Phase 0–4 全完成 + live 端到端 PASS（parity 9.1e-13）** ✅。盤中端到端：`stream`→raw 185 列、`build-ods`→ods IV 76 ok（parity F ES 7557.82/DAX 24978 + Black-76 IV + 同履約價 C/P IV 一致）。🔴 串流必需 pywin32（已修，collector 硬性要求）。**架構一致**：raw 對標 `foreign_futures_bar_1m`、ods 對標 `continuous_bars`(Python 物化表)、cli 對標 capital standalone；`db.read_dataset("ods_quotes","overseas_option_iv")` 可直接消費（excel-builder 就緒）。**測試資料已 TRUNCATE 清空**（兩表 0 列、結構保留）。
 >
