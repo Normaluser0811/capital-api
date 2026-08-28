@@ -274,7 +274,11 @@ def _hybrid_index_changes(q: dict | None, closes: dict[_date, float], as_of: _da
     兩種盤態（A0 Q3 語意）：
     - 快照 day == as_of（今天已開盤）：昨收＝nRef；前日收＝日K「昨天以前」的最大完成列
       （「昨天」那根日期可信、值不可信——KOSPI 污染列掛的就是昨天日期，故只取其日期）。
-    - 快照 day < as_of（未開盤）：昨收＝nClose、前日收＝nRef（全快照，日K 只供週基準）。
+    - 快照 day < as_of（未開盤）：昨收＝nClose、前日收＝nRef。
+      🔴 但 INDEX 頁收盤後會把 nRef 滾成「昨收」（nClose==nRef；2026-08-28 06:31 實測
+      NI225/KOSPI 中招 → 兩頁發布 +0.00% 假值，HHHSI 當時未滾所以正確；各所滾動時點
+      不同）→ 偵測到該簽名時前日收改用日K「< 昨收日」的完成列（未開盤時日K 無盤中
+      污染列，< day_d 的列可信）。
     """
     def _null(reason: str) -> dict:
         return {"daily_pct": None, "weekly_pct": None, "series": series,
@@ -302,7 +306,17 @@ def _hybrid_index_changes(q: dict | None, closes: dict[_date, float], as_of: _da
         last_date = day_d
         last_val = q["close"]
         prev_val = q["ref"]
+        prev_date = "快照nRef"
         mode = f"未開盤：昨收=nClose({last_val})、前日收=nRef({prev_val})"
+        if last_val and prev_val and abs(last_val - prev_val) < 1e-9:
+            # 🔴 nClose==nRef＝「nRef 已被滾成昨收」簽名 → 前日收退日K 完成列
+            hist_dates = [d for d in dates if d < last_date]
+            if not hist_dates:
+                return _null("nRef 已滾成昨收（==nClose）且日K 無更早完成列")
+            prev_date = hist_dates[-1]
+            prev_val = closes[prev_date]
+            mode = (f"未開盤：昨收=nClose({last_val})、前日收=日K {prev_date}"
+                    "（nRef 已滾成昨收，棄用）")
 
     if (as_of - last_date).days > _STALE_DAYS:
         return _null(f"昨收日 {last_date} 距 as_of 過久")
@@ -320,7 +334,7 @@ def _hybrid_index_changes(q: dict | None, closes: dict[_date, float], as_of: _da
         "daily_pct": round(daily, 4) if daily is not None else None,
         "weekly_pct": round(weekly, 4) if weekly is not None else None,
         "last_date": last_date.isoformat(), "last_close": last_val,
-        "prev_date": str(prev_date if day_d >= as_of else "快照nRef"), "prev_close": prev_val,
+        "prev_date": str(prev_date), "prev_close": prev_val,
     }
 
 
