@@ -72,6 +72,25 @@ class TestChainChangesClosedBranch:
                                   date(2026, 8, 28), entry, "SGX,STF2609")
         assert out["daily_pct"] == round((239.0 / 238.8 - 1) * 100, 4)
 
+    def test_cold_chain_rewritten_nref_leaves_blank(self):
+        """🔴 冷鏈 + ref==settle（收盤後 nRef 被改寫簽名，NYM/CME 09:00 實測）→
+        不得算出 settle/ref=+0.00% 假值，必須鏈未接上（讓上層退最後成交鏈）。"""
+        entry = {"active_code": "HO2610", "chains": {}}
+        q = {"close": 41633.0, "ref": 41753.0, "settle": 41753.0, "day": 20260827}
+        out = dump._chain_changes("heating_oil", "HO2610", q, date(2026, 8, 28),
+                                  entry, "NYM,HO2610")
+        assert out["daily_pct"] is None
+        # 本日結算照樣入鏈（settle 是真值），明日起有值
+        assert entry["chains"]["HO2610"]["history"]["2026-08-27"] == 41753.0
+
+    def test_cold_chain_distinct_nref_still_falls_back(self):
+        """ref ≠ settle（未被改寫，06:30 生產時點常態）→ nRef fallback 照常可用。"""
+        entry = {"active_code": "OJF2611", "chains": {}}
+        q = {"close": 147.65, "ref": 146.35, "settle": 147.6, "day": 20260827}
+        out = dump._chain_changes("orange_juice", "OJF2611", q, date(2026, 8, 28),
+                                  entry, "ICEUS,OJF2611")
+        assert out["daily_pct"] == round((147.6 / 146.35 - 1) * 100, 4)  # +0.8541
+
     def test_settle_missing_uses_ref_as_value(self):
         """已收盤但 nSettle=0（哨兵）→ 本日值退用 nRef（原行為保留）。"""
         entry = _rubber_entry()
@@ -111,6 +130,25 @@ class TestChainChangesIntraday:
                                   entry, "CBOT,C2609")
         # settle_date=08-27，week_ago=08-20 → 基準取 08-19
         assert out["weekly_pct"] == round((510.25 / 500.0 - 1) * 100, 4)
+
+    def test_intraday_stale_ref_prefers_stored_settle(self):
+        """🔴 盤中 nRef 過時（DX 實測：day 已滾 08-28、ref 還停在 08-26 結算 99.09）→
+        settle_val 用鏈上既有的正式結算 99.092，且不得被過時 ref 蓋掉。"""
+        entry = {"active_code": "DX2609", "chains": {"DX2609": {"history": {
+            "2026-08-26": 99.09, "2026-08-27": 99.092}}}}
+        q = {"close": 99.065, "ref": 99.09, "settle": 99.092, "day": 20260828}
+        out = dump._chain_changes("dollar_index", "DX2609", q, date(2026, 8, 28),
+                                  entry, "ICEUS,DX2609")
+        assert out["daily_pct"] == round((99.092 / 99.09 - 1) * 100, 4)  # +0.002 非 0.0
+        assert entry["chains"]["DX2609"]["history"]["2026-08-27"] == 99.092  # 未被蓋
+
+    def test_closed_settle_overwrites_history(self):
+        """已收盤 nSettle 有值＝權威 → 覆蓋鏈上舊值（結算修正照走）。"""
+        entry = {"active_code": "C2609",
+                 "chains": {"C2609": {"history": {"2026-08-27": 509.0}}}}
+        q = {"close": 510.0, "ref": 514.0, "settle": 510.25, "day": 20260827}
+        dump._feed_chain(entry, "C2609", q, date(2026, 8, 28))
+        assert entry["chains"]["C2609"]["history"]["2026-08-27"] == 510.25
 
     def test_snapshot_missing_returns_null(self):
         entry = {"active_code": "C2609", "chains": {}}

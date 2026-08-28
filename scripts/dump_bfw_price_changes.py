@@ -411,15 +411,21 @@ def _feed_chain(entry: dict, code: str, q: dict | None,
         day_d = _date(day // 10000, day // 100 % 100, day % 100)
     except ValueError:
         return None
+    ch = entry.setdefault("chains", {}).setdefault(code, {"history": {}})
+    hist = ch["history"]
     if day_d < as_of:
-        settle_date, settle_val = day_d, q.get("settle") or q["ref"]
+        settle_date = day_d
+        # nSettle=0 哨兵時先信鏈上既有值再退 nRef；nSettle 有值＝權威，覆蓋
+        settle_val = q.get("settle") or hist.get(settle_date.isoformat()) or q["ref"]
+        hist[settle_date.isoformat()] = settle_val
     else:
         settle_date = day_d - timedelta(days=1)
         while settle_date.weekday() >= 5:
             settle_date -= timedelta(days=1)
-        settle_val = q["ref"]
-    ch = entry.setdefault("chains", {}).setdefault(code, {"history": {}})
-    ch["history"][settle_date.isoformat()] = settle_val
+        # 🔴 盤中 nRef 可能過時（DX 實測 09:00：day 已滾新日、ref 還停在前前日結算）
+        # → 鏈上既有值（已收盤分支存的正式結算）優先，且**不覆蓋**既有值
+        settle_val = hist.get(settle_date.isoformat()) or q["ref"]
+        hist.setdefault(settle_date.isoformat(), settle_val)
     return day_d, settle_date, settle_val
 
 
@@ -457,7 +463,13 @@ def _chain_changes(key: str, code: str, q: dict | None, as_of: _date,
     if day_d < as_of and q.get("ref"):
         # 已收盤快照自帶 ref（名義上=昨結）：只在鏈缺該日時 fallback
         if prev_v is None:
-            prev_v, prev_src = q["ref"], "nRef(fallback)"
+            if q.get("settle") and abs(q["ref"] - q["settle"]) < 1e-9:
+                # 🔴 ref==settle＝「收盤後 nRef 被改寫成當日結算」簽名（NYM/CME 09:00
+                # 實測 HO/HG/PA/ALI/CL 全中招）→ 昨結不可得，寧可鏈未接上退最後成交鏈，
+                # 也不出 settle/ref=+0.00% 假值
+                prev_src = "nRef 已被改寫（=settle），棄用"
+            else:
+                prev_v, prev_src = q["ref"], "nRef(fallback)"
         elif abs(q["ref"] - prev_v) > 1e-9:
             print(f"   ⚠️ {key}: 快照 nRef({q['ref']}) ≠ 鏈上昨結({prev_v})——"
                   "交易所收盤後改寫 nRef？沿用鏈值（SGX 橡膠 2026-08-28 模式）")
@@ -648,16 +660,22 @@ def main() -> int:
             code2exch[c] = _e
         if snap_codes:
             codes_sorted = sorted(snap_codes)
-            # 分批訂閱（每批 40；page=-1 由 API 配頁，避免單頁上限整批被拒）
+            # 🔴 SKOS 快照頁數有限：第 2 次 RequestStocks(-1) 回 3006
+            # SK_SUBJECT_QUOTE_PAGE_EXCEED（2026-08-28 實測，67 檔雙合約後超過單頁）。
+            # → 同一頁「覆蓋式輪換」：每批訂完等快照全到（存進 state.quotes 後不受
+            #   換頁影響），再用**同一頁**訂下一批（RequestStocks 同頁＝整頁替換）。
+            page_no = -1   # 首批自動配號，之後重用該頁
             for i in range(0, len(codes_sorted), 40):
                 batch = codes_sorted[i:i + 40]
                 nos = "#".join(f"{code2exch[c]},{c}" for c in batch)
-                page, rc = os_lib.SKOSQuoteLib_RequestStocks(-1, nos)
+                page, rc = os_lib.SKOSQuoteLib_RequestStocks(page_no, nos)
                 print(f"📸 快照訂閱 batch{i // 40 + 1} {len(batch)} 檔 rc={rc} page={page}")
-                pump(0.3)
-            t0 = time.time()
-            while time.time() - t0 < 20 and not snap_codes <= set(state.quotes):
-                pump(0.5)
+                if rc == 0 and int(page) >= 0:
+                    page_no = int(page)
+                want = set(batch)
+                t0 = time.time()
+                while time.time() - t0 < 15 and not want <= set(state.quotes):
+                    pump(0.5)
             missing = snap_codes - set(state.quotes)
             print(f"   快照到位 {len(snap_codes) - len(missing)}/{len(snap_codes)}"
                   + (f"，未到：{sorted(missing)}" if missing else ""))
