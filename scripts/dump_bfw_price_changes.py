@@ -123,9 +123,36 @@ SETTLE_CHAIN: dict[str, tuple[str, str]] = {
     "aluminum": ("NYM", "ALI"),
 }
 STATE_PATH = ROOT / "data" / "bfw_settle_state.json"
-# 群益無可用源：台股加權——富時台期貨口徑不同且含夜盤（實測日漲跌方向翻轉）、
-# 國內上市櫃指數線需證券帳戶 → 走 scraper DB fallback（^TWII 現貨，乾淨）。
-UNCOVERED = ("taiex",)
+
+# 🔴 國內期貨（2026-09-15 新增）：走群益**國內**報價線 SKQuoteLib，與海外線
+# SKOSQuoteLib 是兩條各自獨立的連線。
+#
+# 為什麼是現在才加：舊註解寫「台股加權群益無可用源」，那句話對的是**加權指數現貨**
+# （國內指數線需證券帳戶）與**富時台指期貨**（SGX，標的不同且含夜盤，實測方向翻轉）。
+# 台指期（TAIFEX）不在那兩個排除理由裡，只是從來沒人試過。2026-09-15 實測：
+# 國內線連得上、台指期日K 與快照都拿得到（user 拍板改用台指期當日報標的）。
+#
+# 🔴 查詢代碼與下單代碼不是同一個東西。商品清單（RequestStockList(2)）每一筆長這樣：
+#       查詢代碼, 名稱,   到期日,   下單代碼, 契約乘數|tick|, 幣別
+#       TX09AM,  台指09, 20260916, TXFI6,   100000| 1 | ,  NTD
+#    要用來查詢的是 **TX09AM**；`TXFI6` 是下單代碼，丟進 GetStockByNoLONG 或
+#    RequestKLineAMByDate 一律回 SK_FAIL（rc=9999）。這一條踩過整整五輪。
+#
+# 🔴 日漲跌走**快照結算鏈**、不走 K 線：國內線的日K 只有連續代碼（TX00「台指近」）
+#    拿得到，具體月份合約一律 rc=9999。而連續序列是無回調拼接——2026-09-15 實測
+#    近月 TX09AM nRef=45777 vs 次月 TX10AM nRef=45903，換月當天會**憑空跳 +0.28%**，
+#    比日報裡很多真實單日變動還大。所以照 aluminum 那套「結算價累積法」做：
+#    每天把快照的 nRef 存進鏈，隔日起用「今結算/昨結算」算。
+#    代價是冷啟動——鏈要養滿 7 天週漲跌才有值（user 2026-09-15 知情並同意）。
+DOMESTIC_CHAIN: dict[str, tuple[str, str]] = {
+    "taiex": ("TAIFEX", "TX"),      # 台指期；查詢代碼 TX<月><AM>，如 TX10AM
+}
+#: 國內查詢代碼的形狀：root + 兩位月份 + "AM"。刻意排除 TX00AM（那是近月**連續**）。
+_DOMESTIC_CODE_RE = r"^{root}(\d{{2}})AM$"
+
+# 走 scraper DB fallback 的商品（群益沒有同口徑來源）。
+# 2026-09-15：taiex 移出此清單，改由 DOMESTIC_CHAIN 供應。
+UNCOVERED: tuple[str, ...] = ()
 
 _STALE_DAYS = 7
 
@@ -552,6 +579,191 @@ def _parse_kline_rows(rows: list[str]) -> dict[_date, float]:
     return {d: b["close"] for d, b in _parse_kline_bars(rows).items()}
 
 
+def _parse_domestic_catalog(fragments: list[str]) -> list[dict]:
+    """國內商品清單原文 → [{code, name, ltd, order_code}, ...]
+
+    原文格式（實測 RequestStockList(2) 的回傳）：
+        TX09AM,台指09,20260916,TXFI6,100000| 1 | ,NTD;TX10AM,台指10,20261021,TXFJ6,…
+    以 `;` 分筆、`,` 分欄。乘數那一欄自己帶 `|`，但不影響前四欄的位置。
+    """
+    out: list[dict] = []
+    for blob in fragments:
+        for item in blob.split(";"):
+            parts = [p.strip() for p in item.split(",")]
+            if len(parts) < 4 or not parts[0]:
+                continue
+            out.append({"code": parts[0], "name": parts[1],
+                        "ltd": parts[2], "order_code": parts[3]})
+    return out
+
+
+def _domestic_months(catalog: list[dict], root: str, as_of: _date) -> list[str]:
+    """該 root 的逐月查詢代碼，依到期日升冪；只留 LTD ≥ as_of+3 天。
+
+    `as_of+3` 這個緩衝是鏡像海外線的 `_month_codes`——臨到期月強制滾月，
+    免得結算日當天還在追一個當晚就消失的合約。
+    """
+    pat = re.compile(_DOMESTIC_CODE_RE.format(root=re.escape(root)))
+    rows: list[tuple[str, str]] = []
+    for rec in catalog:
+        code = rec["code"]
+        m = pat.match(code)
+        if not m or m.group(1) == "00":        # TX00AM ＝近月連續，不是具體月份
+            continue
+        ltd = rec.get("ltd", "")
+        if not re.fullmatch(r"\d{8}", ltd):
+            continue
+        try:
+            ltd_d = _date(int(ltd[:4]), int(ltd[4:6]), int(ltd[6:]))
+        except ValueError:
+            continue
+        if ltd_d < as_of + timedelta(days=3):
+            continue
+        rows.append((ltd, code))
+    return [c for _ltd, c in sorted(rows)]
+
+
+def _domestic_snapshot(q_lib, sk, code: str) -> dict | None:
+    """國內快照 → `_feed_chain` 吃的形狀 `{day, ref, settle}`。取不到回 None。
+
+    🔴 `settle` 一律 None：國內的 SKSTOCKLONG **沒有** nSettlePrice 欄
+    （那是海外 SKOSSTOCKLONG 才有的）。`_feed_chain` 在 settle 缺值時會退回
+    「鏈上既有值 → nRef」，對國內正是想要的語意（nRef ＝ 交易所給的參考價＝昨結）。
+
+    🔴 **不碰 nClose**。實測盤中 nClose=0（還沒收盤），那與 2026-08-30／09-13 把
+    日經、恆生算成 -100% 的哨兵是同一個東西。這條路徑只用 nRef，結構上踩不到。
+    """
+    try:
+        stock = sk.SKSTOCKLONG()
+        res = q_lib.SKQuoteLib_GetStockByNoLONG(code, stock)
+        # 🔴 comtypes 把 out 參數回成 **list**（不是 tuple）：`[SKSTOCKLONG, rc]`。
+        # 第一版只判 tuple，於是 rc 被賦成整個 list、`rc != 0` 永遠成立 ⇒ 每次都留空。
+        # （單獨寫探針時讀的是傳進去那個 struct——comtypes 原地填值——剛好繞過這個
+        #   判斷，所以探針「成功」而整合後失敗。）
+        if isinstance(res, (tuple, list)):
+            stock, rc = res[0], res[-1]
+        else:
+            rc = res
+    except Exception as exc:  # noqa: BLE001
+        print(f"   ⚠️ 國內快照 {code} 呼叫失敗：{type(exc).__name__}: {exc}")
+        return None
+    if rc != 0:
+        print(f"   ⚠️ 國內快照 {code} rc={rc}")
+        return None
+    dec = int(getattr(stock, "sDecimal", 0) or 0)
+    scale = 10 ** dec if dec else 1
+    ref = (getattr(stock, "nRef", 0) or 0) / scale
+    day = int(getattr(stock, "nTradingDay", 0) or 0)
+    if ref <= 0 or day <= 0:
+        print(f"   ⚠️ 國內快照 {code} 值不可用（nRef={ref}、nTradingDay={day}）")
+        return None
+    return {"day": day, "ref": ref, "settle": None,
+            "name": str(getattr(stock, "bstrStockName", "") or "")}
+
+
+def _run_domestic(as_of: _date, settle_state: dict, prices: dict,
+                  problems: list[str], pump) -> None:
+    """國內期貨（台指期）整段。**任何失敗只讓這幾檔留空，不影響海外那 41 檔。**
+
+    刻意獨立開一條連線、獨立 try/except：這支腳本每天 06:32 餵整份日報，
+    為了新增一檔商品而讓既有的全部一起掛掉是不能接受的。
+    """
+    from capitalapi.skcom import create_quote_lib, get_sk_module  # noqa: PLC0415
+
+    def _blank(reason: str) -> None:
+        for key, (exch, root) in DOMESTIC_CHAIN.items():
+            problems.append(f"{key}（國內線：{reason}）")
+            prices[key] = {"daily_pct": None, "weekly_pct": None,
+                           "series": f"{exch},{root}",
+                           "resolve": f"國內報價線：{reason} → 留空"}
+
+    connected = {"ok": False}
+    q_lib = None
+    try:
+        q_lib = create_quote_lib()
+        sk = get_sk_module()
+
+        class _DomEv:
+            def OnConnection(self, nKind, nCode):          # noqa: N802
+                if int(nKind) == 3003:                      # SK_SUBJECT_CONNECTION_STOCKS_READY
+                    connected["ok"] = True
+
+            def OnNotifyStockList(self, sMarketNo, bstrStockData):   # noqa: N802
+                _dom_lists.append(str(bstrStockData))
+
+            def OnNotifyQuoteLONG(self, sMarketNo, nIndex):          # noqa: N802
+                pass
+
+        _dom_lists: list[str] = []
+        handler = comtypes.client.GetEvents(q_lib, _DomEv())         # noqa: F841
+
+        # 🔴 一定要用 EnterMonitor**LONG**。非 LONG 版送得出去（rc=0）但連線永遠不會
+        # 完成，之後每個查詢都回 1095 SK_ERROR_QUOTE_CONNECT_FIRST——2026-09-15 曾
+        # 據此誤判成「這個帳號沒有國內報價權限」，白繞一大圈。
+        rc = q_lib.SKQuoteLib_EnterMonitorLONG()
+        print(f"🏠 國內報價線 EnterMonitorLONG rc={rc}")
+        t0 = time.time()
+        while time.time() - t0 < 60 and not connected["ok"]:
+            pump(1.0)
+        if not connected["ok"]:
+            _blank("60 秒內沒連上")
+            return
+
+        q_lib.SKQuoteLib_RequestStockList(2)                 # 2 ＝期貨
+        t0 = time.time()
+        while time.time() - t0 < 15 and not _dom_lists:
+            pump(0.5)
+        catalog = _parse_domestic_catalog(_dom_lists)
+        print(f"   商品清單 {len(_dom_lists)} 段、解析出 {len(catalog)} 筆")
+        if not catalog:
+            _blank("商品清單沒收到")
+            return
+
+        for key, (exch, root) in DOMESTIC_CHAIN.items():
+            months = _domestic_months(catalog, root, as_of)
+            if not months:
+                problems.append(f"{key}（{root} 無可用月份）")
+                prices[key] = {"daily_pct": None, "weekly_pct": None,
+                               "series": f"{exch},{root}",
+                               "resolve": f"{root} 無可用月份（LTD ≥ as_of+3）→ 留空"}
+                continue
+            front = months[0]
+            nxt = months[1] if len(months) > 1 else None
+            entry = _migrate_settle_entry(settle_state.setdefault(key, {}))
+
+            # 近月＋次月都餵鏈（與海外線同策略：兩條鏈平常一起養，換月當天無縫）
+            for code in (front, nxt):
+                if code:
+                    snap = _domestic_snapshot(q_lib, sk, code)
+                    if snap:
+                        _feed_chain(entry, code, snap, as_of)
+
+            snap = _domestic_snapshot(q_lib, sk, front)
+            series = f"{exch},{front}"
+            se = _chain_changes(key, front, snap, as_of, entry, series)
+            entry["active_code"] = front
+            _prune_entry(entry, {c for c in (front, nxt) if c}, as_of)
+            entry["updated"] = datetime.now().isoformat(timespec="seconds")
+
+            name = (snap or {}).get("name", "")
+            note = f"{root} 近月 {front}（{name}）候選 {front}/{nxt or '—'}"
+            if se["daily_pct"] is None:
+                problems.append(f"{key}（{series}：{se['resolve'][:80]}）")
+                prices[key] = {"daily_pct": None, "weekly_pct": None, "series": series,
+                               "resolve": f"{note}；{se['resolve']}"}
+                continue
+            prices[key] = {**se, "resolve": f"{note}；{se['resolve']}"}
+    except Exception as exc:  # noqa: BLE001
+        print(f"   ⚠️ 國內線整段失敗：{type(exc).__name__}: {exc}")
+        _blank(f"{type(exc).__name__}: {exc}")
+    finally:
+        if q_lib is not None:
+            try:
+                q_lib.SKQuoteLib_LeaveMonitor()
+            except Exception:  # noqa: BLE001
+                pass
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="BFW 日報價格檔 dump（群益 SKOSQuoteLib）")
     parser.add_argument("--date", default=None, help="as_of 報告日期 YYYY-MM-DD（預設今天台北）")
@@ -800,6 +1012,11 @@ def main() -> int:
             if entry["daily_pct"] is None:
                 problems.append(f"{key}（{entry['resolve']}）")
             prices[key] = entry
+        # 國內期貨（台指期）——獨立一條連線、獨立 try/except，掛掉只影響它自己。
+        # 放在寫狀態檔**之前**，讓國內鏈與海外鏈存進同一份 bfw_settle_state.json。
+        if DOMESTIC_CHAIN:
+            _run_domestic(as_of, settle_state, prices, problems, pump)
+
         STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
         STATE_PATH.write_text(json.dumps(settle_state, ensure_ascii=False, indent=1),
                               encoding="utf-8")
