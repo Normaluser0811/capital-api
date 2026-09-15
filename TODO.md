@@ -1,3 +1,105 @@
+# 🔎 2026-09-15 接手盤點（五專案同步存檔：financialreport／scraper／notion-hub／postgresql-db／capital-api）
+
+> **本段只做了「讀文件 ＋ 實查驗證」，沒有動任何程式碼、沒有連群益、沒有寫任何資料庫。**
+> 方法：11 個代理（5 位讀者逐 repo 讀文件、5 位獨立查證者用不可編造的操作重建 ground truth、
+> 1 位跨專案彙整）＋ 主 session 自己實查。本 repo 工作樹乾淨、main 與 origin 同步、無未併分支。
+
+## 🔴 本 repo 的定位已經變了，但 CLAUDE.md／README.md 完全沒跟上
+
+這個 repo 已經從「群益 COM API 封裝」變成**有生產線在跑**的專案：
+`scripts/dump_bfw_price_changes.py` 每天 06:32 被排程叫起，供應 scraper 商品日報
+**全部 42 檔**商品的漲跌幅。
+
+- `CLAUDE.md`（142 行）與 `README.md`（180 行）**停在 2026-01-18，落後 8 個月**，
+  完全沒提這個 repo 有生產排程在跑
+- `TODO.md` 停在 2026-08-28；真正的現況只在 `next_session_prompt.md`（09-15，含 Part A/B/C 三份交接）
+- ⇒ 接手的人照 CLAUDE.md／README.md 讀，會完全不知道改這支腳本會直接影響每天發出去的日報
+
+## 🔴 P0-1 `_feed_chain()` 的假日缺陷 —— 行事曆的真實缺口與交接寫的不一樣
+
+缺陷本身（user 09-15 同意留到下一輪）：`_feed_chain()` 回推「昨結算日」時只有
+`while settle_date.weekday() >= 5` 跳週末，**對非交易日毫無概念** ⇒ 用 nRef 在鏈上
+`setdefault` 憑空補節點 ⇒ 隔日算出 0.00%。2026-09-08（美國勞動節隔天）造成 **28/41 檔假 0.00%**、全部發佈。
+
+交接寫「`ref_market.trading_calendar_holidays` 2026 年對 CME／ICE 不完整
+（只標 01-01／04-03／12-25），拿它當判準會誤刪真實資料」。實查後**只對了一半**：
+
+| calendar_key | 2026 天數 | kind | 涵蓋到 | 判讀 |
+|---|---|---|---|---|
+| `NYSE` | 10 | `scheduled` | 2035-12-25 | ✅ 完整（含 09-07／11-26）|
+| `CME_Globex_Agriculture` | 10 | `scheduled` | 2035-12-25 | ✅ 完整 |
+| `CME_Globex_Livestock` | 9 | `scheduled` | 2035-12-25 | 缺 06-19 |
+| `CME_Globex_Energy_Metals` | **3** | `scheduled` | 2035-12-25 | ❌ 原油／天然氣／貴金屬走這本 |
+| `ICE_US_Softs`／`ICE_US_Currencies`／`ICE_LIFFE` | **3** | `scheduled` | 2035-12-25 | ❌ 可可咖啡糖棉花走這本 |
+| **`TAIFEX`** | 14 | **441 列全部 `derived_no_tick_file`** | **2026-07-10（過去）** | 🔴 **未來零覆蓋** |
+
+🔴 **交接完全沒提 TAIFEX 這一項，而它正好打中剛上線的台指期**：
+TAIFEX 是唯一一列 `scheduled` 都沒有的主要期貨行事曆，它是從「該平日沒有逐筆來源檔」
+**反推**出來的，結構上只看得到過去。證據：2025 年 TAIFEX vs TWSE 差異為 **0**（全年已過去），
+2026 年差 6 天，其中 5 天是 TWSE 有而 TAIFEX 沒有的**未來**假日：
+
+- **2026-09-25 中秋節（10 天後，台指期第一次踩雷）**
+- 09-28 教師節／10-09 國慶（10-10 週六順延）／10-26 光復節（10-25 週日順延）／12-25 行憲紀念日
+
+（TAIFEX 獨有的 2026-07-10 反而是真的——排定行事曆看不到的臨時休市。兩種來源互補，不是誰取代誰。）
+
+**所以修 `_feed_chain` 的前置比交接想的窄也比它急**：穀物與美股那半的行事曆本來就完整、不必補；
+真正要補的是 `CME_Globex_Energy_Metals` ＋ 三本 ICE ＋ **TAIFEX 的未來排定假日**。
+判準仍照 user 的話寫成「**該日有沒有官方結算價**」而不是「交易所有沒有休市」——
+09-07 那天 NYMEX/COMEX/CME 股指走縮短時段且真的有成交（CL=F 10.3 萬口），只是不產生 09-07 的結算價。
+
+> ⚠️ `ref_market` 維度資料由 ref-market 專案負責，不在本次指派範圍；此處只記錄查證結果。
+> ⚠️ `_feed_chain` 餵的是**全部 33 檔**商品的鏈，改它的風險量級與加一檔商品完全不同。
+
+## ⏰ P0-2 09-16 早班驗收（有時間窗）
+
+實查 `data/bfw_settle_state.json`（09-15 10:22 更新、33 檔）：
+`taiex` 的鏈只有 **1 格**——`TX10AM` 2026-09-14 = 45903、`TX11AM` 2026-09-14 = 46032。
+冷啟動完全如預期：
+
+- **09-16**：日漲跌第一次有值 ← 下一棒要驗的就是這個，順便看 `taiex` 是否多一格
+- **約 09-22**：週漲跌第一次有值（鏈要養滿 7 天）
+- 在那之前台指期欄留空，user 09-15 已知情同意
+
+## 其他本 repo 待辦（讀者盤點，共 19 條）
+
+| 優先 | 項目 | 備註 |
+|---|---|---|
+| P1 | 台指期那 223 行新程式碼零測試覆蓋 | 它已在生產線供應日報一檔商品。至少釘住三件：商品清單那行的解析（**查詢用代碼 `TX09AM` 與下單用代碼 `TXFI6` 是不同欄**）、連續代碼 `TX00` 必須被排除、換月判定 |
+| P1 | `CLAUDE.md` 與 `README.md` 全面重寫 | 停在 2026-01-18，見上 |
+| P1 | `TODO.md` 整理：補上 2026-08-28 之後的落差、刪掉已完成卻仍標未完成的條目 | |
+| P1 | Phase A1 前置：06:30 補跑穀物 spike，實測兩盤之間的 `nTradingDay`／`nRef` 狀態 | |
+| P1 | Phase A1：`src/capitalapi/` 新增海期報價封裝（純 library）| |
+| P2 | Phase A2：pgdb 純新增 `raw_quotes.overseas_future_daily` ＋ macrodata collector 06:00 job | 純新增＝回滾就是 DROP，免針對性備份 |
+| P2 | Phase A3：群益 vs 既有源雙源並跑 ≥5 交易日，彭博信件當異源 oracle 後才切主 | |
+| P2 | 查明 2026-09-11 快照整批失敗的根因，並補失敗告警 | 那次失敗直接造成 scraper 那 12 列「換基準」 |
+| P2 | 海外選擇權 collector 斷線重連未實作（MVP 缺口）| |
+| P2 | excel-builder `feat/overseas-options-greeks` 已 commit 但未 push（且該 repo 無 remote）| 待 user 拍板 |
+| P2 | macrodata `feat/overseas-options-agency` cherry-pick 進 main | |
+| P2 | 🔴 `next_session_prompt.md:274` 仍留著**已作廢**的備份鐵律 | 那句寫「備份落點走 D/E 固態硬碟、勿用 H/G」，已於 2026-08-22 被推翻。現行落點是 `H:\PostgreSQL`（主）＋ `G:\PostgreSQL`（鏡像）。照著做會寫爆 D 槽或被守衛擋住 |
+| P3 | 刪掉 dump 腳本裡已被推翻的 taiex 註解 | 那句「台股加權群益無可用源」對的是加權指數現貨與 SGX 富時台指期，**台指期不在那兩個排除理由裡** |
+| P3 | 海外選擇權多 root 擴充 ＋ 美債 32 分數制（denominator≠1）ODS 解碼分支 | |
+| P3 | 單帳號訂閱上限壓測 | |
+| P3 | `TODO.md` 2026-01 遺留的願望清單需重新評估或刪除；刪除「整合 twmarket 套件」條目（該專案不存在）| |
+
+## 這兩天踩到、下一棒別再踩的坑（原樣保留，已複驗仍有效）
+
+1. **群益國內線一定要用 `EnterMonitorLONG`**。非 LONG 版送得出去（rc=0）但連線永遠不完成，
+   之後每個查詢回 `1095 SK_ERROR_QUOTE_CONNECT_FIRST`。曾據此誤判成「這個帳號沒有國內報價權限」。
+2. **查詢代碼 ≠ 下單代碼**。商品清單每筆是 `TX09AM,台指09,20260916,TXFI6,100000| 1 | ,NTD`
+   ——要用第一欄 `TX09AM`；`TXFI6` 丟進任何查詢一律 rc=9999。
+3. **先讀 `docs/overseas_futures_spike_a0.md`**：那份早就寫著「日報日漲跌＝快照 nClose/nRef；
+   週漲跌＝映射合約 KLine（絕不用 HOT KLine 跨換月）」。日漲跌根本不走 K 線。
+4. **Notion 的百分比欄存的是比值不是百分點**（`round(pct/100, 6)`）。繞過
+   `build_daily_report_properties()` 做局部 PATCH 會連換算一起繞過（曾把 47 頁寫成 100 倍），
+   而**用同一套錯假設寫的驗證會替它背書**。
+5. **comtypes 的 out 參數回的是 `list` 不是 `tuple`** ⇒ 只判 tuple 會讓 rc 永遠不等於 0。
+   單獨寫探針時直接讀傳進去的 struct 剛好繞過這個判斷 ⇒ **探針成功、整合後失敗**。
+6. **判斷「有沒有班正在跑」不可以查 scheduler 的 runs 表**——它跑完才寫列。
+   要看 daemon 的子行程，而且工作量在**孫**行程。
+7. **`SchedulerAutoStart` 是 RunLevel Highest**，未提權的 session 砍不掉它的子行程。
+
+---
 # Capital API 待辦事項
 
 **最後更新**: 2026-08-28
