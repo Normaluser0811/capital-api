@@ -437,17 +437,24 @@ def _migrate_settle_entry(st: dict) -> dict:
     return out
 
 
-def _prev_weekday(d: _date) -> _date:
-    """前一個平日（只跳週末）。
+def _prev_weekday(d: _date, no_settle: list[str] | None = None) -> _date:
+    """前一個可能有官方結算價的日子：跳週末，並跳過已知沒有結算價的日子。
 
-    ⚠️ 它對**非交易日**毫無概念——連假隔天仍會指到休市日。那是另一個已知缺陷
-    （2026-09-08 勞動節隔天 28/41 檔假 0.00%），要靠可信的交易日曆才修得了，
-    而 `ref_market.trading_calendar_holidays` 目前對 CME Energy/Metals 與三本 ICE
-    的 2026 年只有 3 天、TAIFEX 更是對未來零覆蓋 ⇒ 尚不可用。這裡先把原本散在
-    兩處的同一段邏輯收成一支，不改變行為。
+    🔴 `no_settle` 是**這條鏈自己觀測到**的「那天已收盤卻沒有結算價」清單
+    （由 `_feed_chain` 記下），不是外部交易日曆。
+
+    原本這裡寫著「要靠可信的交易日曆才修得了」——**那個前提是錯的**。
+    交易日曆答不出真正該問的問題：2026-09-07 勞動節那天 NYMEX/COMEX/CME 股指
+    走的是縮短時段、**真的有成交**（CL=F 10.3 萬口），只是不產生當日結算價。
+    用「交易所有沒有休市」當判準會誤刪真實資料；而「那天有沒有官方結算價」
+    **快照自己就答得出來**（`nSettle` 缺、且 `nRef` 仍等於鏈上最近一筆結算）。
+
+    ⚠️ 只跳「已觀測到沒有結算價」的日子，不跳沒看過的日子——沒看過不等於沒有，
+    盤中分支正是靠這點在鏈還沒補上昨日結算時仍能正確標記 `nRef`。
     """
+    skip = set(no_settle or ())
     d -= timedelta(days=1)
-    while d.weekday() >= 5:
+    while d.weekday() >= 5 or d.isoformat() in skip:
         d -= timedelta(days=1)
     return d
 
@@ -490,14 +497,34 @@ def _feed_chain(entry: dict, code: str, q: dict | None,
             # ⚠️ 只由旗標驅動、**不可**推廣到海外：nRef 語意逐交易所而異——
             # SGX 收盤後把 nRef 改寫成**當日**結算（橡膠 2026-08-28），
             # NYMEX/CME 改寫成 = settle（下面 `_chain_changes` 已有棄用判斷）。
-            settle_date = _prev_weekday(day_d)
+            settle_date = _prev_weekday(day_d, ch.get("no_settle"))
             settle_val = hist.get(settle_date.isoformat()) or q["ref"]
             hist.setdefault(settle_date.isoformat(), settle_val)
         else:
-            settle_val = q["ref"]
-            hist[settle_date.isoformat()] = settle_val
+            # day_d 已收盤、沒有 nSettle、鏈上也沒有這一天。兩種可能：
+            #   (a) 真交易日但 nSettle 是 0 哨兵 —— nRef 帶來新資訊（SGX 收盤後會把
+            #       nRef 改寫成**當日**結算，橡膠 2026-08-28）⇒ 照舊掛在 day_d。
+            #   (b) 那天根本沒有官方結算價（休市／縮短時段不結算）—— nRef 仍是
+            #       **前一個交易日**的結算 ⇒ 掛在 day_d 就會造出一個與前一日逐位元組
+            #       相同的假節點，隔天 daily = 同值相除 = +0.00%。
+            # 判別器＝nRef 與鏈上最近一筆結算是否相同。2026-09-07 勞動節實測：
+            # 有 09-07 節點的 56 條裡 49 條與 09-04 完全相同（美國線休市），
+            # 7 條不同（Brent／橡膠／恆生科技／A50 那天有開）。正常日「與前一節點
+            # 等值」的基準率只有 0~2%，而那些走的是 nSettle 權威分支、進不到這裡。
+            prior = [x for x in hist if x < settle_date.isoformat()]
+            latest = max(prior) if prior else None
+            if latest is not None and hist[latest] and abs(hist[latest] - q["ref"]) < 1e-9:
+                no_settle = ch.setdefault("no_settle", [])
+                if settle_date.isoformat() not in no_settle:
+                    no_settle.append(settle_date.isoformat())
+                # 本日值退回鏈上最近一筆真結算 ⇒ 沿用前一個真實漲跌（與週末同行為）
+                settle_date = _date.fromisoformat(latest)
+                settle_val = hist[latest]
+            else:
+                settle_val = q["ref"]
+                hist[settle_date.isoformat()] = settle_val
     else:
-        settle_date = _prev_weekday(day_d)
+        settle_date = _prev_weekday(day_d, ch.get("no_settle"))
         # 🔴 盤中 nRef 可能過時（DX 實測 09:00：day 已滾新日、ref 還停在前前日結算）
         # → 鏈上既有值（已收盤分支存的正式結算）優先，且**不覆蓋**既有值
         settle_val = hist.get(settle_date.isoformat()) or q["ref"]
@@ -588,6 +615,10 @@ def _prune_entry(entry: dict, keep_codes: set[str], as_of: _date) -> None:
     for ch in entry["chains"].values():
         ch["history"] = {d: v for d, v in ch["history"].items()
                          if (as_of - _date.fromisoformat(d)).days <= 30}
+        # 「那天沒有結算價」的紀錄與 history 同窗修剪，否則會無限長大
+        if ch.get("no_settle"):
+            ch["no_settle"] = [d for d in ch["no_settle"]
+                               if (as_of - _date.fromisoformat(d)).days <= 30]
 
 
 def _parse_kline_bars(rows: list[str]) -> dict[_date, dict]:

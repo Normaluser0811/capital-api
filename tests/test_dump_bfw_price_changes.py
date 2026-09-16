@@ -438,3 +438,100 @@ class TestDomesticRefIsPrevDay:
         dump._feed_chain(entry, "STF2609", q, date(2026, 8, 28))
         assert entry["chains"]["STF2609"]["history"] == {"2026-08-27": 238.8}, \
             "海外仍應掛在 day_d 當天"
+
+
+# ------------------------------------------------- 休市日不得產生假結算節點（2026-09-07 勞動節）
+
+class TestHolidayNoSettleNode:
+    """2026-09-07 美國勞動節事故：49/56 條鏈被寫進一個與前一交易日等值的假節點。
+
+    ## 怎麼發生的（離線重現過）
+    `_feed_chain` 的**已收盤分支**在「`day_d < as_of` ＋ 沒有 nSettle ＋ 鏈上也沒有
+    `day_d`」時，會把 `nRef` 當成 `day_d` 當天的結算價寫進鏈。而休市日根本沒有結算價，
+    `nRef` 是**前一個交易日**的結算 ⇒ 鏈上多出一個與前一日逐位元組相同的節點
+    ⇒ 隔天 `daily = 同值 / 同值 - 1 = +0.00%`，模型再據此寫出「平盤整理」的內文發上 Notion。
+
+    🔴 **不是** `_prev_weekday` 造成的（文件原本記成那樣）。週末之所以沒事，是因為
+    交易所根本不回報週末的 `nTradingDay`，不是因為那支函式擋住了。
+
+    ## 判別器：`nRef` 與鏈上最近一筆結算是否相同
+    2026-09-07 實測：有 09-07 節點的 56 條裡 **49 條與 09-04 完全相同**（美國線休市），
+    **7 條不同**（Brent／橡膠／恆生科技／A50——那天這些交易所有開、有真結算）。
+    而正常日「與前一節點等值」的基準率是 0~2%，且那些走的是 nSettle 權威分支、
+    根本不會進到這個判斷 ⇒ 誤判成本極低。
+    """
+
+    FRI, HOLIDAY, TUE = "2026-09-04", "2026-09-07", "2026-09-08"
+    V_THU, V_FRI = 3495.75, 3473.25          # 鋁 ALI2611 真實結算
+
+    def _entry(self):
+        return {"active_code": "ALI2611", "chains": {"ALI2611": {"history": {
+            "2026-09-03": self.V_THU, self.FRI: self.V_FRI}}}}
+
+    def test_休市日不寫進鏈_並記下沒有結算價(self):
+        entry = self._entry()
+        q = {"day": 20260907, "settle": 0, "ref": self.V_FRI}   # nRef＝週五結算
+        day_d, settle_date, settle_val = dump._feed_chain(
+            entry, "ALI2611", q, date(2026, 9, 8))
+        ch = entry["chains"]["ALI2611"]
+        assert self.HOLIDAY not in ch["history"], \
+            f"休市日被寫進鏈了：{ch['history']}"
+        assert self.HOLIDAY in ch.get("no_settle", []), "沒有記下『那天沒有結算價』"
+        # 本日值要退回鏈上最近一筆真結算，而不是掛在休市日上
+        assert settle_date == date(2026, 9, 4) and settle_val == self.V_FRI
+
+    def test_休市隔天不再算出假平盤_而是沿用前一個真實漲跌(self):
+        entry = self._entry()
+        q = {"day": 20260907, "settle": 0, "ref": self.V_FRI}
+        out = dump._chain_changes("aluminum", "ALI2611", q,
+                                  date(2026, 9, 8), entry, "LME,ALI2611")
+        assert out["daily_pct"] != 0, "又算出假平盤了"
+        # 週五對週四的真實漲跌，沿用發佈（與週末的行為一致）
+        assert out["daily_pct"] == round((self.V_FRI / self.V_THU - 1) * 100, 4)
+
+    def test_盤中分支不得把假節點造回來(self):
+        """修掉已收盤那條還不夠：隔天盤中 `_prev_weekday` 會指回休市日並 setdefault。"""
+        entry = self._entry()
+        entry["chains"]["ALI2611"]["no_settle"] = [self.HOLIDAY]
+        q = {"day": 20260908, "settle": 0, "ref": self.V_FRI}   # day_d >= as_of ⇒ 盤中
+        dump._feed_chain(entry, "ALI2611", q, date(2026, 9, 8))
+        assert self.HOLIDAY not in entry["chains"]["ALI2611"]["history"], \
+            "盤中分支把假節點造回來了"
+
+    def test_國內線也要跳過沒有結算價的日子(self):
+        """台指期走 ref_is_prev_day，同樣用 `_prev_weekday` 回推 ⇒ 同樣會踩到。"""
+        entry = {"active_code": "TX10AM", "chains": {"TX10AM": {
+            "history": {"2026-09-24": 45900.0}, "no_settle": ["2026-09-25"]}}}
+        # 09-28（教師節）也休市；快照 day 落在 09-25 這個已知沒有結算價的日子
+        q = {"day": 20260928, "settle": None, "ref": 45900.0, "ref_is_prev_day": True}
+        dump._feed_chain(entry, "TX10AM", q, date(2026, 9, 29))
+        assert "2026-09-25" not in entry["chains"]["TX10AM"]["history"]
+
+    def test_哨兵結算但nRef是新值_仍照舊寫入(self):
+        """🔴 回歸守衛：SGX 收盤後會把 nRef 改寫成**當日**結算（橡膠 2026-08-28）。
+
+        那是刻意保留的行為，判別器不可以把它一起關掉——差別正在於 nRef 與鏈上
+        最近一筆**不同**。
+        """
+        entry = {"active_code": "STF2609", "chains": {"STF2609": {"history": {
+            "2026-08-25": 235.3, "2026-08-26": 236.3}}}}
+        q = {"close": 239.0, "ref": 238.8, "settle": 0, "day": 20260827}
+        dump._feed_chain(entry, "STF2609", q, date(2026, 8, 28))
+        assert entry["chains"]["STF2609"]["history"]["2026-08-27"] == 238.8
+        assert "2026-08-27" not in entry["chains"]["STF2609"].get("no_settle", [])
+
+    def test_鏈是空的時候不可以自作聰明(self):
+        """冷啟動沒有可比對的最近值 ⇒ 維持原行為（掛在 day_d），否則海外那條會被改壞。"""
+        entry = {"active_code": "STF2609", "chains": {}}
+        q = {"close": 239.0, "ref": 238.8, "settle": 0, "day": 20260827}
+        dump._feed_chain(entry, "STF2609", q, date(2026, 8, 28))
+        assert entry["chains"]["STF2609"]["history"] == {"2026-08-27": 238.8}
+
+    def test_修剪會一起清掉過期的no_settle(self):
+        entry = {"active_code": "ALI2611", "chains": {"ALI2611": {
+            "history": {"2026-09-04": 3473.25, "2026-07-01": 1.0},
+            "no_settle": ["2026-09-07", "2026-07-04"]}}}
+        dump._prune_entry(entry, {"ALI2611"}, date(2026, 9, 16))
+        ch = entry["chains"]["ALI2611"]
+        assert "2026-07-01" not in ch["history"], "舊 history 沒被修剪"
+        assert ch["no_settle"] == ["2026-09-07"], f"no_settle 沒被修剪：{ch['no_settle']}"
