@@ -437,6 +437,21 @@ def _migrate_settle_entry(st: dict) -> dict:
     return out
 
 
+def _prev_weekday(d: _date) -> _date:
+    """前一個平日（只跳週末）。
+
+    ⚠️ 它對**非交易日**毫無概念——連假隔天仍會指到休市日。那是另一個已知缺陷
+    （2026-09-08 勞動節隔天 28/41 檔假 0.00%），要靠可信的交易日曆才修得了，
+    而 `ref_market.trading_calendar_holidays` 目前對 CME Energy/Metals 與三本 ICE
+    的 2026 年只有 3 天、TAIFEX 更是對未來零覆蓋 ⇒ 尚不可用。這裡先把原本散在
+    兩處的同一段邏輯收成一支，不改變行為。
+    """
+    d -= timedelta(days=1)
+    while d.weekday() >= 5:
+        d -= timedelta(days=1)
+    return d
+
+
 def _feed_chain(entry: dict, code: str, q: dict | None,
                 as_of: _date) -> tuple[_date, _date, float] | None:
     """把本次快照的結算價寫進**該合約自身**的鏈（近月/次月平常一起養＝切換日無縫）。
@@ -457,12 +472,32 @@ def _feed_chain(entry: dict, code: str, q: dict | None,
     if day_d < as_of:
         settle_date = day_d
         # nSettle=0 哨兵時先信鏈上既有值再退 nRef；nSettle 有值＝權威，覆蓋
-        settle_val = q.get("settle") or hist.get(settle_date.isoformat()) or q["ref"]
-        hist[settle_date.isoformat()] = settle_val
+        if q.get("settle"):
+            settle_val = q["settle"]
+            hist[settle_date.isoformat()] = settle_val
+        elif hist.get(settle_date.isoformat()):
+            settle_val = hist[settle_date.isoformat()]
+        elif q.get("ref_is_prev_day"):
+            # 🔴 國內線（2026-09-16 修）：nRef 是 **day_d 的前一交易日**結算，
+            # 不是 day_d 當天的。原本三段退回 `settle or 鏈上 or ref` 共用同一個
+            # `settle_date = day_d` 標籤，而三者語意不同 ⇒ 退到 ref 時差一天。
+            #
+            # 事故：09-16 06:57（台股 08:45 才開盤、nTradingDay 仍是 09-15）把
+            # 09-14 的結算 45903.0 寫成 `hist["2026-09-15"]`，日漲跌算出 +0.00%，
+            # 模型據此寫「結算日多空拉鋸持平」發上 Notion。官方 raw_taifex 佐證：
+            # 45903.0／46032.0 正是 09-14 的 TX 202610／202611 結算價。
+            #
+            # ⚠️ 只由旗標驅動、**不可**推廣到海外：nRef 語意逐交易所而異——
+            # SGX 收盤後把 nRef 改寫成**當日**結算（橡膠 2026-08-28），
+            # NYMEX/CME 改寫成 = settle（下面 `_chain_changes` 已有棄用判斷）。
+            settle_date = _prev_weekday(day_d)
+            settle_val = hist.get(settle_date.isoformat()) or q["ref"]
+            hist.setdefault(settle_date.isoformat(), settle_val)
+        else:
+            settle_val = q["ref"]
+            hist[settle_date.isoformat()] = settle_val
     else:
-        settle_date = day_d - timedelta(days=1)
-        while settle_date.weekday() >= 5:
-            settle_date -= timedelta(days=1)
+        settle_date = _prev_weekday(day_d)
         # 🔴 盤中 nRef 可能過時（DX 實測 09:00：day 已滾新日、ref 還停在前前日結算）
         # → 鏈上既有值（已收盤分支存的正式結算）優先，且**不覆蓋**既有值
         settle_val = hist.get(settle_date.isoformat()) or q["ref"]
@@ -509,6 +544,12 @@ def _chain_changes(key: str, code: str, q: dict | None, as_of: _date,
                 # 實測 HO/HG/PA/ALI/CL 全中招）→ 昨結不可得，寧可鏈未接上退最後成交鏈，
                 # 也不出 settle/ref=+0.00% 假值
                 prev_src = "nRef 已被改寫（=settle），棄用"
+            elif q.get("ref_is_prev_day"):
+                # 🔴 國內線：nRef 已經被 `_feed_chain` 當成 **settle_date 當天**的值
+                # 用掉了（它就是 day_d 前一交易日的結算）⇒ 不可以同一個數字再當
+                # 「settle_date 的前一天」。那正是 09-16 台指期 +0.00% 的成因：
+                # 分子分母都是 09-14 的結算。拿不到更早的結算就留空。
+                prev_src = "nRef 已用作本日值，不可再當昨結"
             else:
                 prev_v, prev_src = q["ref"], "nRef(fallback)"
         elif abs(q["ref"] - prev_v) > 1e-9:
@@ -658,6 +699,11 @@ def _domestic_snapshot(q_lib, sk, code: str) -> dict | None:
         print(f"   ⚠️ 國內快照 {code} 值不可用（nRef={ref}、nTradingDay={day}）")
         return None
     return {"day": day, "ref": ref, "settle": None,
+            # 🔴 nRef ＝ **nTradingDay 前一交易日**的結算，不是 nTradingDay 當天的。
+            # `_feed_chain` 的已收盤分支預設 nRef 就是 day_d 當天（那對 SGX／NYMEX
+            # 那種「收盤後改寫 nRef」的交易所成立），對 TAIFEX 不成立 ⇒ 必須明講，
+            # 否則差一天（2026-09-16 台指期 +0.00% 假平盤事故）。
+            "ref_is_prev_day": True,
             "name": str(getattr(stock, "bstrStockName", "") or "")}
 
 
