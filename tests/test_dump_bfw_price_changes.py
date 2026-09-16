@@ -362,3 +362,79 @@ class TestParseKline:
                 "garbage", "10:30, 1, 2, 3, 4, 5"]
         closes = dump._parse_kline_rows(rows)
         assert closes == {date(2026, 8, 26): 140.95}
+
+
+class TestDomesticRefIsPrevDay:
+    """國內線的 nRef 是「nTradingDay 前一交易日」的結算，不是當天的（2026-09-16）。
+
+    事故：2026-09-16 06:57 的 dump 把台指期日漲跌算成 +0.00%，模型寫出
+    「結算日多空拉鋸持平」並發佈到 Notion。鏈上實際是
+
+        TX10AM: {"2026-09-14": 45903.0, "2026-09-15": 45903.0}
+        TX11AM: {"2026-09-14": 46032.0, "2026-09-15": 46032.0}
+
+    用期交所官方 raw_taifex.futures_daily 驗證：45903.0 與 46032.0 正是 09-14 的
+    結算價（TX 202610／202611）⇒ 09-15 那格是 09-14 的複製品。
+
+    機制：_domestic_snapshot 的 settle 恆為 None（SKSTOCKLONG 沒有 nSettlePrice 欄），
+    於是 _feed_chain 已收盤分支走到第三段退回 q["ref"]，但三段語意不同——
+    settle 是 day_d 當天的結算、ref 是 day_d 前一天的結算——日期卻一律標成 day_d。
+
+    為什麼 09-15 對、09-16 錯：09-15 10:22 開盤後跑，nTradingDay=09-15、as_of=09-15
+    ⇒ 走盤中分支（settle_date = day_d − 1）⇒ 正確；09-16 06:57 開盤前跑，
+    TAIFEX 的 nTradingDay 要到 08:45 才滾、仍是 09-15，as_of=09-16 ⇒ 走已收盤分支
+    ⇒ 貼錯日期。日報固定 06:30 觸發、永遠早於 08:45 ⇒ 台指期每天都會踩。
+
+    為什麼只修國內不動海外：nRef 語意逐交易所而異，不可一律前移一天。
+    SGX 收盤後把 nRef 改寫成當日結算（橡膠 2026-08-28；既有的
+    test_settle_missing_uses_ref_as_value 測的就是那個刻意的正確行為）；
+    NYMEX/CME 則改寫成 = settle（_chain_changes 已有棄用判斷）。
+    所以改動只由 _domestic_snapshot 帶的 ref_is_prev_day 旗標驅動。
+    """
+
+    TAIEX_Q = {"day": 20260915, "ref": 45903.0, "settle": None,
+               "ref_is_prev_day": True}
+
+    def test_ref_lands_on_the_previous_trading_day_not_day_d(self):
+        entry = {"active_code": "TX10AM", "chains": {}}
+        dump._feed_chain(entry, "TX10AM", dict(self.TAIEX_Q), date(2026, 9, 16))
+        hist = entry["chains"]["TX10AM"]["history"]
+        assert "2026-09-15" not in hist, "09-15 的結算還沒拿到，不可以憑空寫一格"
+        assert hist == {"2026-09-14": 45903.0}
+
+    def test_the_actual_incident_produces_blank_not_fake_zero(self):
+        """事故重演：06:57 跑 ⇒ 日漲跌必須留空，不可以是 +0.00%。"""
+        entry = {"active_code": "TX10AM",
+                 "chains": {"TX10AM": {"history": {"2026-09-14": 45903.0}}}}
+        out = dump._chain_changes("taiex", "TX10AM", dict(self.TAIEX_Q),
+                                  date(2026, 9, 16), entry, "TAIFEX,TX10AM")
+        assert out["daily_pct"] is None, f"應留空，實際 {out['daily_pct']}"
+        assert entry["chains"]["TX10AM"]["history"] == {"2026-09-14": 45903.0}
+
+    def test_after_market_open_the_real_value_comes_out(self):
+        """08:45 後 nTradingDay 滾成 09-16、nRef 變成 09-15 真實結算 ⇒ 算得出來。
+
+        這條證明修法不是把台指期永久留空，只是拒絕在拿不到資料時瞎猜。
+        """
+        entry = {"active_code": "TX10AM",
+                 "chains": {"TX10AM": {"history": {"2026-09-14": 45903.0}}}}
+        q = {"day": 20260916, "ref": 46150.0, "settle": None, "ref_is_prev_day": True}
+        out = dump._chain_changes("taiex", "TX10AM", q,
+                                  date(2026, 9, 16), entry, "TAIFEX,TX10AM")
+        assert out["daily_pct"] == round((46150.0 / 45903.0 - 1) * 100, 4)
+        assert entry["chains"]["TX10AM"]["history"]["2026-09-15"] == 46150.0
+
+    def test_previous_trading_day_skips_weekend(self):
+        """day_d − 1 要跳週末：週一(09-14)的前一交易日是週五(09-11)。"""
+        entry = {"active_code": "TX10AM", "chains": {}}
+        q = {"day": 20260914, "ref": 46372.0, "settle": None, "ref_is_prev_day": True}
+        dump._feed_chain(entry, "TX10AM", q, date(2026, 9, 15))
+        assert entry["chains"]["TX10AM"]["history"] == {"2026-09-11": 46372.0}
+
+    def test_overseas_without_the_flag_is_completely_unchanged(self):
+        """沒帶旗標的海外快照行為逐字不變——橡膠那條路不可以被動到。"""
+        entry = {"active_code": "STF2609", "chains": {}}
+        q = {"close": 239.0, "ref": 238.8, "settle": 0, "day": 20260827}
+        dump._feed_chain(entry, "STF2609", q, date(2026, 8, 28))
+        assert entry["chains"]["STF2609"]["history"] == {"2026-08-27": 238.8}, \
+            "海外仍應掛在 day_d 當天"
