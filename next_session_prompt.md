@@ -1,6 +1,174 @@
+# 🟢 2026-09-18 交接：假日假平盤已修；09-25／09-28 有時效性觀察任務
+
+> 本段最新。
+>
+> **本 repo 本次的程式變動**：`_feed_chain` 休市日不再寫進結算鏈（main `5c034b6`／`067d8a2`），
+> 全套 93 passed。🔴 根因與舊文件記載的**不同**，詳見 `TODO.md` 最上面那段與下方「兩件文件寫錯」。
+
+## ⏳ 接手第一件事：09-18 的整庫備份**還在跑**，先確認它的結局
+
+user 09-18 拍板「等備份完畢再開新 session 接下一個任務」，所以你接手時它可能已經結束。
+
+**正確的查法**（🔴 交接曾經寫 `success=1`，但 `ops.db_backup_log` **沒有** `success` 欄，
+那是 scheduler 的 sqlite `runs` 的欄位；照舊指令跑會直接 `ERROR: column "success" does not exist`）：
+
+```sql
+SELECT host, started_at, finished_at, status, duration_seconds,
+       round(duration_seconds/3600.0,2) AS 小時, trigger_source, skip_reason
+  FROM ops.db_backup_log ORDER BY started_at DESC LIMIT 5;
+```
+
+| 結果 | 判讀 |
+|---|---|
+| `status='success'`、duration 約 40,000 秒（11 小時上下）| ✅ `max_locks_per_transaction` 512 的修正驗收通過，這條 P0 關掉 |
+| `status='failed'`、stdout 出現 `out of shared memory` / `max_locks_per_transaction` | 🔴 再往上調到 768（改 `docker-compose.yml` 的 `command:`，**不要**改資料卷裡的 `postgresql.conf`）|
+| 紀錄表**沒有**當天的列 | 它可能還在跑：去看 `H:\PostgreSQL\macrodata_20260918_030002.dump` 的大小有沒有在長，並 `docker exec macrodata-timescaledb ps aux | grep pg_dump` |
+
+**離開本 session 時的狀態（09-18 09:5x）**：`pg_dump` 活著、檔案 180.8 GiB 且持續在長、
+已跑 6.9 小時。🔴 **它已經撐過 09-11 那次「跑 5.3 小時就 failed」的點**，
+是好跡象，但**跑完才算驗收**。上一次成功的整庫 dump 是 268.9 GB／11.3 小時。
+
+### ⚠️ 備份期間有一個 DDL 卡在鎖佇列（user 已知並拍板不取消）
+
+`TRUNCATE ods_ams.gulf_export_bids` 自 09-18 07:35（台北）起等在 `pg_dump` 後面。
+離開時**只有它 1 個等待者**、沒有連鎖阻塞。它會在 dump 收工後自己過關，
+但在那之前**任何要讀 `ods_ams.gulf_export_bids` 的東西都會排在它後面**（PG 鎖佇列 FIFO）。
+要查現況：
+
+```sql
+SELECT w.pid, left(w.query,40), b.pid, left(b.query,40)
+  FROM pg_stat_activity w
+  JOIN LATERAL unnest(pg_blocking_pids(w.pid)) AS bp(pid) ON true
+  JOIN pg_stat_activity b ON b.pid = bp.pid WHERE w.datname='macrodata';
+```
+
+---
+
+## 🟢 SEC batch 001 已完成 —— 修正前後是兩個世界
+
+`batch_001_resume3`（09-16 14:00~18:26）跑的是含**瀏覽器重用修正**的 scraper main：
+
+| | resume1（舊碼）| **resume3（修正後）** |
+|---|---|---|
+| 成功 | 5,232（**25%**）| **13,976（99.99%）** |
+| Playwright driver 死亡空燒 | **12,471 筆** | **0** |
+| DNS 失敗 | **3,073** | **0** |
+| 其他失敗 | 15,580 | 1 壞 PDF ＋ 1 other |
+
+批次**確實完成**：`Skipped 23,734 filings already in local registry` ＋ 本輪 13,976
+⇒ 這 100 家約 37,710 份申報已落地；`FAILED:` 只有 1 行、`not in SEC ticker map` 0 行。
+
+### 🔴 DNS 陣發失敗**不必再追了**——它是同一個根因的第二個症狀
+
+修掉瀏覽器重用之後它自己消失：獨立探針在 11 小時（10:56~22:01，完整涵蓋 resume3）
+**取樣 2,630 次、0 次失敗**；resume1 同樣長度的窗裡有 6 次叢集、3,073 筆失敗。
+
+因果鏈：**每份 PDF 重啟一次 node driver ＋ msedge（實測每分鐘 85 對行程生滅、連續 98 分鐘）
+把 Windows 的名稱解析服務打爆** ⇒ 整台機器的 `getaddrinfo` 在 4~5 分鐘的區間全滅
+⇒ 連完全不碰 Chromium 的 `bloomberg_watch_guard`（純 CPython `imaplib`）
+都在同樣六個窗內失敗，窗外每次都成功。
+
+🔴 **當初「已排除：不是系統 DNS」那個推論錯在兩層**，值得記住這個形狀：
+① 對**陣發性**失效做抽樣，等於專門抽到好的那一半；
+② `nslookup` **不走 `getaddrinfo`**，它繞過 Windows DNS Client 與其快取
+⇒ 它成功證不了應用程式那條路正常。要排除某一層，證據必須來自**不共用那一層**的獨立對象。
+
+### 下一棒可以直接開 batch 002
+
+指令照 `D:\tmp\sec_full_history_batches\README.md`，但有兩點要改：
+
+1. 🔴 **一律帶 `PYTHONIOENCODING=utf-8` ＋ `PYTHONUTF8=1`**。用
+   `Start-Process -RedirectStandardOutput` 起這支若不設，日誌整份是 Big5 亂碼
+   （`另 90 家` → `嚗 90 摰塚?`），中文檔名 grep 不到、事後會誤判成「沒紀錄」。
+2. **時程要重算**：實測下載吞吐 **73.2 份/分鐘**（README 估的「6 worker 約 120 份/分鐘」
+   與交接估的「16.5 份/分鐘」都不對）。batch 001 全程 4.4 小時，但它有 23,734 份是
+   前幾輪已下載而跳過的 ⇒ **一個全新的批次要估成「列清單 1~2 小時 ＋ 下載份數 ÷ 73/分鐘」**，
+   batch 001 那種規模約 10 小時。後段批次是小公司、份數會少很多，**不要用單一數字外推 26 批**。
+
+⚠️ 仍未做：`scheduler` 的 `sec_filings` 的 `sync_gdrive` 還是 `false`（抓歷史期間關掉雲端上傳）。
+全部批次跑完要改回 `true` 並重啟 daemon，**而且要另外補傳**——
+`GDRIVE_UPLOAD_CMD` 帶 `--since-days 1`、上傳端又依 `mtime` 過濾
+⇒ 改回 true 之後暫停期間的檔案**永遠不會自動補傳**，目前已累積上萬份。
+該改動在 scheduler 仍**未 commit**。
+
+---
+
+## 🟢 商品日報：61 篇文章的錯誤數值已加更正聲明（09-18 完成）
+
+09-15 那次更正**只改了數值欄、文章沒改**。09-18 實查：81 列被更正，其中 **61 列**的文章
+仍引用更正前的數值（09-16 只抓到 27 列，是因為只 grep `0.00%`）。
+最嚴重的是 08-30 的**恆生與日經**，文章逐字寫著 **「-100.00%」**，真值是 +0.07% 與 +0.41%。
+
+處置：**加一行更正聲明置頂，原文完整保留為紀錄**（不換數字——文章是繞著錯值寫的，
+黃金真值 −1.39% 而原句是「持平於 +0.00%」，換數字會留下更荒謬的句子；也不重生——
+那等於用今天的模型重寫十幾天前的行情分析）。
+
+| | 結果 |
+|---|---|
+| 針對性備份 | `D:\tmp\daily_report_prose_fix_20260918_prose_fix.tsv`（61 列全欄）＋ 逐列 `_restore.sql` |
+| DB `ods_bloomberg.daily_report.note` | **61/61**，獨立 COUNT 複查 |
+| Notion `Note` 屬性 | **60/60**，逐頁重讀複查、0 失敗 |
+| 沒有 Notion 頁的 1 列 | `2026-09-14 brent_crude`（+3.36% → −2.81%，方向翻轉那批之一）|
+
+🔴 **踩到一個文件沒寫的事**：日報的文章**不在頁面內文，而在 `Note` 這個 rich_text 屬性裡**
+（實查該頁內容區塊數 = 0）⇒ 用 `append_block_children` 加更正區塊，會加在讀者看不到的地方。
+
+---
+
+## 📅 09-25／09-28 有一個**時效性**觀察任務（中秋、教師節）
+
+台指期 09-11 才上線，**還沒經歷過任何台灣假日**，09-25（週五）是第一次。
+
+模擬預測：連假期間日報**沿用 09-24 的真實漲跌**（與週末同行為），
+而 **09-30 那天會留空**（鏈上 09-24→09-29 相隔 5 個日曆天 > `_chain_changes` 的 4 天容忍度）。
+這個預測建立在一個**未驗證的假設**上：休市日 `nTradingDay` 停在最後交易日。
+
+⇒ **09-25、09-28、09-29、09-30 逐日記下**：快照的 `nTradingDay`、
+`data/bfw_settle_state.json` 裡 taiex 鏈的節點、日報的日漲跌。
+拿到證據再決定要不要改那條 4 天判準。
+
+🔴 **不要現在就去放寬那條判準**：它擋的正是「漏抓造成的資料洞」
+（09-11 快照整批失敗那次，30 列就是多日變動偽裝成日漲跌）。
+**改壞的後果是錯的數字，現狀的後果只是留空——後者安全得多。**
+
+---
+
+## 🔴 兩件「文件寫錯、已由實測推翻」，別再照舊文件做
+
+### 1. SEC 批次全滅的根因不是 DNS，是每份 PDF 重啟一次瀏覽器
+
+`html_to_pdf.py` 舊版把 `sync_playwright()` ＋ `chromium.launch()` 放在**單份 PDF 的轉檔函式內**。
+已修（scraper main `587609e`／`999b826`）：每執行緒一顆瀏覽器重用、每份只開 context、
+200 頁換一顆、driver 死掉重建重試、`_process_folder` 收尾關掉。
+
+### 2. 假日假平盤的根因不是 `_prev_weekday`，也不需要交易日曆
+
+寫出假節點的是 `_feed_chain` **已收盤分支最後那個 `else`**（把 `nRef` 當成 `day_d` 當天的
+結算價寫進鏈）。週末之所以沒事，是因為交易所根本不回報週末的 `nTradingDay`
+——離線重現真餵一個週六進去，**同樣會捏造**。
+
+而「要靠可信的交易日曆才修得了」這個前提是錯的：交易日曆答不出該問的問題
+（09-07 那天 NYMEX／COMEX／CME 股指走**縮短時段、真的有成交**，只是不產生結算價），
+而「那天有沒有官方結算價」**快照自己就答得出來**。
+已修（capital-api main `5c034b6`／`067d8a2`）。
+
+---
+
+## 🟡 待拍板／未做（都有實查依據）
+
+| # | 事項 | 現況 |
+|---|---|---|
+| 1 | TAIFEX 行事曆補 144 列（2026-09-25~2035-12-31，照 TWSE 官方預定假日書）| **建議不要現在做**——可行性已驗（TAIFEX 是 `library_source='manual'`，同步程式與 `ingest_holidays.py` 都會跳過它），但**沒有任何程式讀它**。先定消費端再補 |
+| 2 | 連假後那一天留空 | 見上面的觀察任務。**先觀察再改** |
+| 3 | postgresql-db 遠端兩支分支 | **建議保留**。內容層級比對：0 個 main 缺少的檔案，那 +1,591 行全是被 main 取代的舊版本；但它們的 commit 不是 main 的祖先 ⇒ 是那批六月分支歷史僅存的紀錄。SHA：`origin/feat/margin-ingestion=e10adff`、`origin/feat/taifex-option-tick=1d0ed30`。本機兩支（真空殼）已於 09-16 刪除 |
+| 4 | `reports.company_filings` 兩條來源同時停滯 | TWSE 自 2026-06-15 起零落地（兩季台股財報全缺）、SEC `created_at` 停在 2026-09-09，而兩支排程天天 exit 0。**中間還缺一整步：全歷史抓下來的檔案沒有任何待辦說要跑「磁碟→DB 入庫」** |
+| 5 | 排程有 18 個 enabled 的 job 從未成功或最後成功早於 09-09 | 其中 `macrodata_usda_psd` 最後成功是 08-15，而它是 WASDE 事件鏈的**資料來源**；`daily_commodity_report` 跑 150 次 **0 成功** |
+| 6 | 09-08 那 49 個假節點仍在鏈上 | 判定**無害**（值與 09-04 逐位元組相同），30 天修剪窗會在 2026-10-07 自動清掉 |
+
+---
 # 🟢 2026-09-16：台指期 +0.00% 假平盤事故 —— 已修、已更正、已併回 main
 
-> 本段最新。下面的 Part C（09-15 國內報價線上線）／Part A（海期價格源）／Part B（海外選擇權）都沒動、內容仍有效。
+> 下面的 Part C（09-15 國內報價線上線）／Part A（海期價格源）／Part B（海外選擇權）都沒動、內容仍有效。
 
 ## 一句話
 
@@ -126,7 +294,7 @@
 
 # 🟢 2026-09-15：Part C｜國內報價線（台指期）已上線
 
-> 本段最新。下面的 Part A（海期價格源）與 Part B（海外選擇權）都沒動、內容仍有效。
+> 下面的 Part A（海期價格源）與 Part B（海外選擇權）都沒動、內容仍有效。
 
 ## 做了什麼
 
