@@ -5,42 +5,48 @@
 > **本 repo 本次的程式變動**：`_feed_chain` 休市日不再寫進結算鏈（main `5c034b6`／`067d8a2`），
 > 全套 93 passed。🔴 根因與舊文件記載的**不同**，詳見 `TODO.md` 最上面那段與下方「兩件文件寫錯」。
 
-## ⏳ 接手第一件事：09-18 的整庫備份**還在跑**，先確認它的結局
+## ✅ 09-18 整庫備份**驗收通過** —— `max_locks_per_transaction` 那條 P0 已結案
 
-user 09-18 拍板「等備份完畢再開新 session 接下一個任務」，所以你接手時它可能已經結束。
+> 2026-09-19 實查確認。**下一棒不必再查這件事**（09-18 寫交接時它還在跑，所以原文是「先確認它的結局」）。
 
-**正確的查法**（🔴 交接曾經寫 `success=1`，但 `ops.db_backup_log` **沒有** `success` 欄，
-那是 scheduler 的 sqlite `runs` 的欄位；照舊指令跑會直接 `ERROR: column "success" does not exist`）：
+| 項目 | 結果 |
+|---|---|
+| `status` | **success** |
+| 起訖（台北）| 09-18 03:00 → **14:32** |
+| 耗時 | **11.55 小時**（41,563 秒）|
+| 大小 | **269.0 GiB** |
+| 鏡像 | **`mirror_verified = t`**（G: 已做 sha256 逐位元組對帳）|
+| 觸發 | `scheduled`（排程自己跑的，不是手動補的）|
+
+**同樣是排程觸發的兩次對照**，證明 512 這個值夠用：
+
+| 日期 | 結果 | 耗時 |
+|---|---|---|
+| 09-11 | **failed** | 5.35 小時（`out of shared memory`）|
+| **09-18** | **success** | **11.55 小時** |
+
+歷來成功的幾次是 11.32／11.05／11.07 小時，這次 11.55 完全同一個量級
+⇒ **不需要再往上調到 768**。兩碟各留 2 份（`--keep 2`）。
+
+- 守衛（`guard_db_backup`）的 7 天線現在落在 **2026-09-25 14:32**。
+- 09-19 03:00 那班正確跳過（`skip_reason`：最近一次完成於 09-18 14:32、0.5 天前 ≤ 5.0 天）。
+- 09-18 卡在 pg_dump 後面的 `TRUNCATE ods_ams.gulf_export_bids` **已於 dump 收工後自己過關**
+  （現在等鎖連線數 0、該表 41,068 列），沒有擴散成連鎖阻塞。
+
+🔴 **查這張表要用 `status` 不是 `success`**——`ops.db_backup_log` 沒有 `success` 欄
+（那是 scheduler 的 sqlite `runs` 的欄位），照舊指令會直接
+`ERROR: column "success" does not exist`：
 
 ```sql
-SELECT host, started_at, finished_at, status, duration_seconds,
-       round(duration_seconds/3600.0,2) AS 小時, trigger_source, skip_reason
+SELECT started_at, finished_at, status, duration_seconds,
+       round(size_bytes/1024.0^3,1) AS GiB, mirror_verified, trigger_source, skip_reason
   FROM ops.db_backup_log ORDER BY started_at DESC LIMIT 5;
 ```
 
-| 結果 | 判讀 |
-|---|---|
-| `status='success'`、duration 約 40,000 秒（11 小時上下）| ✅ `max_locks_per_transaction` 512 的修正驗收通過，這條 P0 關掉 |
-| `status='failed'`、stdout 出現 `out of shared memory` / `max_locks_per_transaction` | 🔴 再往上調到 768（改 `docker-compose.yml` 的 `command:`，**不要**改資料卷裡的 `postgresql.conf`）|
-| 紀錄表**沒有**當天的列 | 它可能還在跑：去看 `H:\PostgreSQL\macrodata_20260918_030002.dump` 的大小有沒有在長，並 `docker exec macrodata-timescaledb ps aux | grep pg_dump` |
-
-**離開本 session 時的狀態（09-18 09:5x）**：`pg_dump` 活著、檔案 180.8 GiB 且持續在長、
-已跑 6.9 小時。🔴 **它已經撐過 09-11 那次「跑 5.3 小時就 failed」的點**，
-是好跡象，但**跑完才算驗收**。上一次成功的整庫 dump 是 268.9 GB／11.3 小時。
-
-### ⚠️ 備份期間有一個 DDL 卡在鎖佇列（user 已知並拍板不取消）
-
-`TRUNCATE ods_ams.gulf_export_bids` 自 09-18 07:35（台北）起等在 `pg_dump` 後面。
-離開時**只有它 1 個等待者**、沒有連鎖阻塞。它會在 dump 收工後自己過關，
-但在那之前**任何要讀 `ods_ams.gulf_export_bids` 的東西都會排在它後面**（PG 鎖佇列 FIFO）。
-要查現況：
-
-```sql
-SELECT w.pid, left(w.query,40), b.pid, left(b.query,40)
-  FROM pg_stat_activity w
-  JOIN LATERAL unnest(pg_blocking_pids(w.pid)) AS bp(pid) ON true
-  JOIN pg_stat_activity b ON b.pid = bp.pid WHERE w.datname='macrodata';
-```
+🔴 **「有備份檔」≠「還原得回來」**：本次只證明 dump 跑完且腳本自檢過了。
+可還原性仍要靠 `postgresql-db/scripts/restore_drill.py` 做還原演練
+（⚠️ 整庫演練不要塞進排程：全庫還原會在容器內再長出一份等量資料，
+WSL2 的 vhdx 只長不縮，2026-06-28 有寫滿讓 PG crash-loop 的前科）。
 
 ---
 
