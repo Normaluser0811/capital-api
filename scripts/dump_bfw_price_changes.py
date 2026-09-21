@@ -8,6 +8,11 @@ scraper 生成管線不碰 COM。
 - 期貨＝**結算價鏈**：快照 nRef/nSettle＝正式結算價，逐日存 `data/bfw_settle_state.json`，
   日漲跌＝今結算/昨結算（同合約）。🔴 昨結「鏈 history 優先、nRef 只當 fallback」
   ——SGX 收盤後會把 nRef 改寫成非昨結的值（2026-08-28 橡膠 +0.08% vs 真值 +1.14%）。
+- 🔴 **國內線（台指期）的結算價不由快照取得，由期交所官網每日行情餵**（2026-09-21）。
+  國內的 SKSTOCKLONG 沒有 nSettlePrice 欄，唯一來源 nRef 又永遠是「nTradingDay 的
+  前一交易日」，而 nTradingDay 要到隔天 08:45 開盤才跳 ⇒ 06:32 的排程結構上拿不到
+  最後一個交易日的結算，鏈永遠落後一天（09-17~09-21 連 5 天發錯）。詳見
+  `_taifex_official_settles()` 上方那段。
 - **最活絡月自動換月**（2026-08-28）：候選＝LTD 排序近月＋次月（錨＝state active 與
   HOT 映射較晚者，單向不回滾；鋁無 HOT 走同一套）；次月連 2 完成日成交量 > 近月
   → 切換報導合約（橘子汁：HOT 08-28 仍指 Sep、市場 08-24 已移倉 Nov）。兩條鏈
@@ -146,8 +151,11 @@ STATE_PATH = ROOT / "data" / "bfw_settle_state.json"
 #    拿得到，具體月份合約一律 rc=9999。而連續序列是無回調拼接——2026-09-15 實測
 #    近月 TX09AM nRef=45777 vs 次月 TX10AM nRef=45903，換月當天會**憑空跳 +0.28%**，
 #    比日報裡很多真實單日變動還大。所以照 aluminum 那套「結算價累積法」做：
-#    每天把快照的 nRef 存進鏈，隔日起用「今結算/昨結算」算。
-#    代價是冷啟動——鏈要養滿 7 天週漲跌才有值（user 2026-09-15 知情並同意）。
+#    把結算價逐日存進鏈，用「今結算/昨結算」算。
+#    ⛔ 原本這裡寫「每天把**快照的 nRef** 存進鏈……代價是冷啟動」——**那兩句已作廢**
+#    （2026-09-21）。靠 nRef 餵鏈會讓鏈**永遠落後一個交易日**（連 5 天發錯漲跌幅，
+#    根因見 `_taifex_official_settles()` 上方）；現在鏈由**期交所官方每日行情**餵，
+#    一次帶回 12 個日曆天 ⇒ 也不再有冷啟動，週漲跌第一天就有值。
 DOMESTIC_CHAIN: dict[str, tuple[str, str]] = {
     "taiex": ("TAIFEX", "TX"),      # 台指期；查詢代碼 TX<月><AM>，如 TX10AM
 }
@@ -857,8 +865,15 @@ def _domestic_snapshot(q_lib, sk, code: str) -> dict | None:
     """國內快照 → `_feed_chain` 吃的形狀 `{day, ref, settle}`。取不到回 None。
 
     🔴 `settle` 一律 None：國內的 SKSTOCKLONG **沒有** nSettlePrice 欄
-    （那是海外 SKOSSTOCKLONG 才有的）。`_feed_chain` 在 settle 缺值時會退回
-    「鏈上既有值 → nRef」，對國內正是想要的語意（nRef ＝ 交易所給的參考價＝昨結）。
+    （那是海外 SKOSSTOCKLONG 才有的；2026-09-21 由
+    `scripts/probe_domestic_snapshot.py` 實測證實，此前只是這樣寫著沒人量過）。
+
+    ⛔ 原本這裡接著寫「`_feed_chain` 退回『鏈上既有值 → nRef』，對國內正是想要的
+    語意」——**那句已作廢**（2026-09-21）。nRef 是「nTradingDay 的**前一個**交易日」
+    的結算，而 nTradingDay 要到隔天 08:45 開盤才跳 ⇒ 06:32 的排程靠它餵鏈，
+    鏈**結構上永遠補不到最後一個交易日**（09-17~09-21 連 5 天發出前一交易日的漲跌幅）。
+    現在鏈在餵快照**之前**已由 `_taifex_official_settles()` 用官方結算價墊好，
+    `_feed_chain` 的「鏈上既有值優先」那條分支因此拿到的是正確的當日結算。
 
     🔴 **不碰 nClose**。實測盤中 nClose=0（還沒收盤），那與 2026-08-30／09-13 把
     日經、恆生算成 -100% 的哨兵是同一個東西。這條路徑只用 nRef，結構上踩不到。
