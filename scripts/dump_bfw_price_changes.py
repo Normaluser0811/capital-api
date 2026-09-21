@@ -29,11 +29,15 @@ scraper 生成管線不碰 COM。
 from __future__ import annotations
 
 import argparse
+import csv
+import io
 import json
 import os
 import re
 import sys
 import time
+import urllib.parse
+import urllib.request
 from datetime import date as _date, datetime, timedelta
 from pathlib import Path
 
@@ -651,6 +655,160 @@ def _parse_kline_rows(rows: list[str]) -> dict[_date, float]:
     return {d: b["close"] for d, b in _parse_kline_bars(rows).items()}
 
 
+# ─────────────── 期交所官方結算價（2026-09-21 新增）───────────────
+#
+# 🔴 為什麼非要它不可：國內快照唯一拿得到的結算價來源是 `nRef`，而 `nRef` 永遠是
+# 「`nTradingDay` 的**前一個**交易日」的結算；而 `nTradingDay` 要到**隔天 08:45
+# 開盤**才跳。2026-09-21 實測四個時點：
+#     06:32 → nTradingDay=20260918、nRef=46459（09-17 結算）
+#     11:41 → nTradingDay=20260921、nRef=47428（09-18 結算）
+#     15:02 / 15:12 / 15:35（夜盤已開 35 分鐘）→ **仍是 20260921、仍是 47428**
+# ⇒ 06:32 的排程**結構上**拿不到最後一個交易日的結算，結算鏈永遠落後一個交易日。
+# ⇒ 原本規劃的「傍晚多跑一次餵鏈」**實測不成立**，別再試那條。
+#
+# 實際後果：日報 2026-09-17 ~ 09-21 連續 5 天發出的台指期漲跌幅都是**前一個交易日**
+# 的（09-21 發 +0.87%，官方結算價算出的真值 +2.09%），5 天全部發上了 Notion。
+#
+# 官方每日行情（`futDataDown`）實測**當天 15:09 就有當日結算價**
+# （2026-09-21 TX 202610 結算 48053）⇒ 隔天 06:32 一定來得及。
+# ⚠️ **不要改用 `openapi.taifex.com.tw/v1/DailyMarketReportFut`**：同一天的
+# 15:07／15:19／15:34 三次，它回的最新日期都還停在 09-18，比官網下載介面慢。
+# ⚠️ 走 stdlib `urllib` 而不引入 `requests`：capital-api 是純 library 專案，
+# 為了一天一次的 POST 加一個依賴不划算（它的 .venv 目前也沒有 requests）。
+TAIFEX_FUT_DAILY_DOWNLOAD = "https://www.taifex.com.tw/cht/3/futDataDown"
+_TAIFEX_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+_TAIFEX_TIMEOUT_S = 45
+#: 回看天數。7 個日曆天是週漲跌的基準需要的，再加連假緩衝。
+#: ⚠️ 與 `_prune_entry` 的 30 天保留窗相容（12 < 30）。
+_TAIFEX_LOOKBACK_D = 12
+
+#: 官方 CSV 必備欄位。表頭對不上就整批放棄——期交所的表頭會隨查詢視窗變
+#: （選擇權日行情已有前例），硬用欄位位置會靜默讀到別的欄。
+_TAIFEX_COLS = ("交易日期", "契約", "到期月份(週別)", "結算價", "交易時段")
+
+
+def _taifex_official_settles(root: str, as_of: _date, *,
+                             lookback_days: int = _TAIFEX_LOOKBACK_D,
+                             timeout_s: int = _TAIFEX_TIMEOUT_S,
+                             fetch=None) -> dict:
+    """期交所官方每日行情 → `{契約月: {日期: 結算價}}`。取不到一律回 `{}`，**不拋**。
+
+    失敗不可以炸掉整條國內線：拿不到官方值就退回原本的快照鏈，而下游
+    （scraper `load_price_file` 的陳舊閘門）會把落後的值**留空**
+    ——留空遠比「發一個看起來完全正常的舊數字」好。
+
+    四條過濾各自對應一個會靜默出錯的形狀：
+    - 只收 `交易時段 == 一般`：`盤後` 那列的結算價欄是 `-`。
+    - 只收六位數的到期月份：價差交易的月份欄長成 `202610/202611`。
+    - 丟掉結算價 0：最後交易日當天交易所不發結算價，本欄是 0 哨兵（網頁顯示 `-`），
+      拿它去相除會算出 -100%（本專案 2026-08/09 已為同型哨兵出過兩次事）。
+    - 只收 `交易日 < as_of`：報告日 D 講的是 D **之前**最後一個交易日的收盤。
+    """
+    start = as_of - timedelta(days=lookback_days)
+    body_params = {
+        "down_type": "1",
+        "queryStartDate": f"{start:%Y/%m/%d}",
+        "queryEndDate": f"{as_of:%Y/%m/%d}",
+        "commodity_id": root,
+    }
+    if fetch is None:
+        def fetch(params: dict) -> bytes:
+            req = urllib.request.Request(
+                TAIFEX_FUT_DAILY_DOWNLOAD,
+                data=urllib.parse.urlencode(params).encode("ascii"),
+                headers={"User-Agent": _TAIFEX_UA,
+                         "Content-Type": "application/x-www-form-urlencoded"},
+            )
+            with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+                return resp.read()
+
+    try:
+        body = fetch(body_params)
+    except Exception as exc:  # noqa: BLE001
+        print(f"   ⚠️ 期交所官方行情取得失敗（{type(exc).__name__}: {exc}）——退回快照鏈")
+        return {}
+    try:
+        text = body.decode("big5")
+    except UnicodeDecodeError as exc:
+        # 🔴 不可以用 errors="replace" 硬吞：那會讓壞掉的回應長得像正常資料。
+        print(f"   ⚠️ 期交所回應不是 Big5（{exc}）——退回快照鏈")
+        return {}
+
+    rows = list(csv.reader(io.StringIO(text)))
+    if not rows:
+        print("   ⚠️ 期交所回應是空的——退回快照鏈")
+        return {}
+    header = [c.strip() for c in rows[0]]
+    try:
+        idx = {name: header.index(name) for name in _TAIFEX_COLS}
+    except ValueError:
+        print(f"   ⚠️ 期交所表頭與預期不符（{header[:6]}）——退回快照鏈")
+        return {}
+
+    out: dict = {}
+    span = max(idx.values())
+    for r in rows[1:]:
+        if len(r) <= span:
+            continue
+        if r[idx["契約"]].strip() != root:
+            continue
+        if r[idx["交易時段"]].strip() != "一般":
+            continue
+        month = r[idx["到期月份(週別)"]].strip()
+        if not re.fullmatch(r"\d{6}", month):
+            continue
+        try:
+            settle = float(r[idx["結算價"]].strip().replace(",", ""))
+        except ValueError:
+            continue
+        if settle == 0:
+            continue
+        try:
+            day = _date.fromisoformat(r[idx["交易日期"]].strip().replace("/", "-"))
+        except ValueError:
+            continue
+        if day >= as_of:
+            continue
+        out.setdefault(month, {})[day.isoformat()] = settle
+    return out
+
+
+def _domestic_contract_month(catalog: list, code: str):
+    """由商品清單的最後交易日推出契約月 `YYYYMM`。查不到回 None。
+
+    TX 的最後交易日就落在契約月之內（TX10AM → ltd 20261021 → 202610）。
+    刻意**不**由代碼的兩位月份自己推年份——跨年時 `TX01AM` 的年份要靠 as_of 猜，
+    而清單裡本來就帶著確定答案。
+    """
+    for rec in catalog:
+        if rec.get("code") == code:
+            ltd = str(rec.get("ltd", ""))
+            return ltd[:6] if re.fullmatch(r"\d{8}", ltd) else None
+    return None
+
+
+def _seed_chain_from_official(entry: dict, code: str, settles: dict):
+    """把官方結算價寫進該合約自身的鏈。回傳 `(寫入筆數, 與原值不同的說明清單)`。
+
+    官方值**優先**：那是交易所自己發布的結算價，比從快照 `nRef` 推出來的權威。
+    但「改掉既有值」一定要看得見 —— 差異清單交給呼叫端印出來，否則哪天官方與快照
+    系統性不一致，這裡會**無聲地改寫歷史**，而畫面上完全正常。
+    """
+    ch = entry.setdefault("chains", {}).setdefault(code, {"history": {}})
+    hist = ch["history"]
+    changed = []
+    written = 0
+    for day, value in sorted(settles.items()):
+        old = hist.get(day)
+        if old is not None and abs(old - value) <= 1e-9:
+            continue
+        if old is not None:
+            changed.append(f"{day}: {old} -> {value}")
+        hist[day] = value
+        written += 1
+    return written, changed
+
+
 def _parse_domestic_catalog(fragments: list[str]) -> list[dict]:
     """國內商品清單原文 → [{code, name, ltd, order_code}, ...]
 
@@ -807,6 +965,24 @@ def _run_domestic(as_of: _date, settle_state: dict, prices: dict,
             front = months[0]
             nxt = months[1] if len(months) > 1 else None
             entry = _migrate_settle_entry(settle_state.setdefault(key, {}))
+
+            # 🔴 先用**期交所官方結算價**把鏈墊好，再餵快照。順序不可反：
+            # `_feed_chain` 的已收盤分支是「鏈上有這一天就用鏈上的」，官方值先進去
+            # 之後，那條分支自然會拿到正確的當日結算，不必改 `_feed_chain` 一行。
+            official = _taifex_official_settles(root, as_of)
+            for code in (front, nxt):
+                if not code:
+                    continue
+                month = _domestic_contract_month(catalog, code)
+                if not month or month not in official:
+                    print(f"   ⚠️ {code}：官方行情沒有契約月 {month or '（推不出來）'}"
+                          f"，本合約退回快照鏈")
+                    continue
+                n, changed = _seed_chain_from_official(entry, code, official[month])
+                print(f"   📥 {code} 官方結算價寫入 {n} 筆"
+                      f"（契約月 {month}，共 {len(official[month])} 天）")
+                for line in changed:
+                    print(f"      🔴 官方值與鏈上既有值不同 {line}")
 
             # 近月＋次月都餵鏈（與海外線同策略：兩條鏈平常一起養，換月當天無縫）
             for code in (front, nxt):

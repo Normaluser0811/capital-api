@@ -535,3 +535,180 @@ class TestHolidayNoSettleNode:
         ch = entry["chains"]["ALI2611"]
         assert "2026-07-01" not in ch["history"], "舊 history 沒被修剪"
         assert ch["no_settle"] == ["2026-09-07"], f"no_settle 沒被修剪：{ch['no_settle']}"
+
+
+# ---------------------------------------------------------------- 期交所官方結算價（2026-09-21 新增）
+#
+# 起因：台指期的日報漲跌幅**每天慢一個交易日**，2026-09-17 ~ 09-21 連續 5 天發上 Notion。
+# 根因：國內快照唯一拿得到的結算價來源是 `nRef`，而它永遠是「`nTradingDay` 的前一個
+# 交易日」的結算；`nTradingDay` 要到**隔天 08:45 開盤**才跳（09-21 實測：06:32→20260918、
+# 11:41→20260921，而夜盤開盤後的 15:02／15:12／15:35 **三次都還是 20260921**）
+# ⇒ 06:32 的排程結構上拿不到最後一個交易日的結算。
+#
+# ⚠️ 本節期望值一律寫死，不從被測模組的常數反推。
+
+
+def _csv(rows) -> bytes:
+    """組一份與期交所官網同形狀的 Big5 CSV（欄位順序照實測）。"""
+    header = ("交易日期,契約,到期月份(週別),開盤價,最高價,最低價,收盤價,漲跌價,漲跌%,"
+              "成交量,結算價,未沖銷契約數,最後最佳買價,最後最佳賣價,歷史最高價,歷史最低價,"
+              "是否因訊息面暫停交易,交易時段,價差對單式委託成交量")
+    lines = [header]
+    for d, contract, month, settle, session in rows:
+        lines.append(f"{d},{contract},{month},1,1,1,1,1,1%,1,{settle},1,1,1,1,1,,{session},,")
+    return ("\n".join(lines) + "\n").encode("big5")
+
+
+def _fetch(body: bytes):
+    return lambda params: body
+
+
+REAL_ROWS = [
+    ("2026/09/15", "TX", "202610  ", "45727", "一般"),
+    ("2026/09/16", "TX", "202610  ", "46060", "一般"),
+    ("2026/09/17", "TX", "202610  ", "46459", "一般"),
+    ("2026/09/18", "TX", "202610  ", "47428", "一般"),
+]
+
+
+def test_official_settles_parses_the_real_shape():
+    out = dump._taifex_official_settles("TX", date(2026, 9, 21), fetch=_fetch(_csv(REAL_ROWS)))
+    assert out == {"202610": {"2026-09-15": 45727.0, "2026-09-16": 46060.0,
+                              "2026-09-17": 46459.0, "2026-09-18": 47428.0}}
+
+
+def test_official_settles_drops_the_night_session_row():
+    """`盤後` 那列的結算價欄是 `-`；收進來會讓當天多一個假節點。"""
+    rows = REAL_ROWS + [("2026/09/18", "TX", "202610  ", "-", "盤後")]
+    out = dump._taifex_official_settles("TX", date(2026, 9, 21), fetch=_fetch(_csv(rows)))
+    assert out["202610"]["2026-09-18"] == 47428.0
+
+
+def test_official_settles_drops_spread_months():
+    """價差交易的月份欄長成 `202610/202611`，收進來會多出一條不存在的合約鏈。"""
+    rows = REAL_ROWS + [("2026/09/18", "TX", "202610/202611", "129", "一般")]
+    out = dump._taifex_official_settles("TX", date(2026, 9, 21), fetch=_fetch(_csv(rows)))
+    assert set(out) == {"202610"}
+
+
+def test_official_settles_drops_the_zero_sentinel():
+    """最後交易日當天不發結算價，本欄是 0 哨兵（網頁顯示 `-`）。
+
+    拿 0 去相除會算出 -100% —— 這條線 2026-08/09 已經為同型哨兵出過兩次事。
+    """
+    rows = REAL_ROWS + [("2026/09/14", "TX", "202609  ", "0", "一般")]
+    out = dump._taifex_official_settles("TX", date(2026, 9, 21), fetch=_fetch(_csv(rows)))
+    assert "202609" not in out
+
+
+def test_official_settles_excludes_the_report_date_itself():
+    """報告日 D 講的是 D **之前**最後一個交易日的收盤，D 當天的不可以收。"""
+    rows = REAL_ROWS + [("2026/09/21", "TX", "202610  ", "48053", "一般")]
+    out = dump._taifex_official_settles("TX", date(2026, 9, 21), fetch=_fetch(_csv(rows)))
+    assert "2026-09-21" not in out["202610"]
+    out2 = dump._taifex_official_settles("TX", date(2026, 9, 22), fetch=_fetch(_csv(rows)))
+    assert out2["202610"]["2026-09-21"] == 48053.0
+
+
+def test_official_settles_returns_empty_when_the_header_moves():
+    """表頭對不上就整批放棄 —— 期交所的表頭會隨查詢視窗變，硬用欄位位置會讀到別的欄。"""
+    body = _csv(REAL_ROWS).replace("結算價".encode("big5"), "結算".encode("big5"))
+    assert dump._taifex_official_settles("TX", date(2026, 9, 21), fetch=_fetch(body)) == {}
+
+
+def test_official_settles_returns_empty_on_bad_encoding():
+    """🔴 解不開就放棄，**不可以**用 errors='replace' 硬吞成看起來正常的資料。"""
+    assert dump._taifex_official_settles(
+        "TX", date(2026, 9, 21), fetch=_fetch(b"\xff\xfe\x00bad")) == {}
+
+
+def test_official_settles_never_raises_when_the_fetch_fails():
+    """抓不到不可以炸掉整條國內線 —— 退回快照鏈，下游閘門會把落後的值留空。"""
+    def boom(params):
+        raise TimeoutError("connection timed out")
+    assert dump._taifex_official_settles("TX", date(2026, 9, 21), fetch=boom) == {}
+
+
+def test_official_settles_asks_for_the_right_window_and_commodity():
+    seen = {}
+
+    def spy(params):
+        seen.update(params)
+        return _csv(REAL_ROWS)
+
+    dump._taifex_official_settles("TX", date(2026, 9, 21), lookback_days=12, fetch=spy)
+    assert seen["commodity_id"] == "TX"
+    assert seen["queryEndDate"] == "2026/09/21"
+    assert seen["queryStartDate"] == "2026/09/09", "回看窗要涵蓋週漲跌的 7 個日曆天"
+
+
+def test_contract_month_comes_from_the_catalog_not_the_code():
+    """跨年時 `TX01AM` 的年份靠代碼推不出來，清單裡的最後交易日才是確定答案。"""
+    catalog = [{"code": "TX01AM", "name": "台指01", "ltd": "20270120", "order_code": "TXAH7"}]
+    assert dump._domestic_contract_month(catalog, "TX01AM") == "202701"
+    assert dump._domestic_contract_month(catalog, "TX02AM") is None
+    assert dump._domestic_contract_month([{"code": "TX01AM", "ltd": "n/a"}], "TX01AM") is None
+
+
+def test_seeding_reports_values_that_disagree_with_the_chain():
+    """官方值優先，但改掉既有值一定要看得見，否則會無聲改寫歷史。"""
+    entry = {"chains": {"TX10AM": {"history": {"2026-09-17": 46459.0,
+                                               "2026-09-18": 99999.0}}}}
+    n, changed = dump._seed_chain_from_official(
+        entry, "TX10AM", {"2026-09-17": 46459.0, "2026-09-18": 47428.0})
+    assert n == 1, "值相同的那天不算寫入"
+    assert changed == ["2026-09-18: 99999.0 -> 47428.0"]
+    assert entry["chains"]["TX10AM"]["history"]["2026-09-18"] == 47428.0
+
+
+# ---- 端到端：官方值墊完之後，06:32 的快照要算出**不落後**的漲跌幅 ----
+
+
+def test_seeded_chain_makes_the_0632_snapshot_produce_the_right_day():
+    """🔴 這支是整個修法的證明。
+
+    重播 2026-09-21 06:32 的真實情境：
+      - 鏈上原本只有 09-14 ~ 09-17（09-18 那筆結構上永遠進不來）
+      - 快照 nTradingDay=20260918、nRef=46459（＝09-17 的結算）
+    未墊官方值 ⇒ 算出 +0.8663%（09-17 的漲跌，就是當天實際發出去的錯值）。
+    墊了官方值（09-18 結算 47428）⇒ 算出 **+2.0857%**，即 09-18 的真實漲跌。
+    """
+    q = {"day": 20260918, "ref": 46459.0, "settle": None, "ref_is_prev_day": True}
+    as_of = date(2026, 9, 21)
+    base = {"2026-09-14": 45903.0, "2026-09-15": 45727.0,
+            "2026-09-16": 46060.0, "2026-09-17": 46459.0}
+
+    broken = {"active_code": "TX10AM", "chains": {"TX10AM": {"history": dict(base)}}}
+    out = dump._chain_changes("taiex", "TX10AM", q, as_of, broken, "TAIFEX,TX10AM")
+    assert round(out["daily_pct"], 4) == 0.8663, "未墊官方值時應重現當天發錯的值"
+    assert out["last_date"] == "2026-09-17"
+
+    fixed = {"active_code": "TX10AM", "chains": {"TX10AM": {"history": dict(base)}}}
+    dump._seed_chain_from_official(fixed, "TX10AM", {"2026-09-18": 47428.0})
+    out = dump._chain_changes("taiex", "TX10AM", q, as_of, fixed, "TAIFEX,TX10AM")
+    assert round(out["daily_pct"], 4) == 2.0857, "墊了官方值就要算出 09-18 的真實漲跌"
+    assert out["last_date"] == "2026-09-18"
+    assert out["last_close"] == 47428.0
+    # 🔴 這條路徑的 prev_close 一律是 None、prev_date 一律是字串「結算鏈」——
+    # 昨結是哪一天只寫在 resolve 裡。驗它才驗得到「分母取的是 09-17 而不是 09-16」。
+    assert "鏈2026-09-17" in out["resolve"], out["resolve"]
+
+
+def test_seeded_chain_also_unblocks_the_weekly_change():
+    """官方值一次帶回 12 天 ⇒ 週漲跌不再因為冷啟動而永遠留空。
+
+    ⚠️ 這是修法的**附帶效果**，不是漲跌幅本身的缺陷：09-14 才冷啟動的鏈湊不滿
+    7 個日曆天，此前 `weekly_pct` 一律 None 是真實的「算不出來」。
+    """
+    q = {"day": 20260918, "ref": 46459.0, "settle": None, "ref_is_prev_day": True}
+    entry = {"active_code": "TX10AM", "chains": {"TX10AM": {"history": {}}}}
+    dump._seed_chain_from_official(entry, "TX10AM", {
+        "2026-09-09": 45100.0, "2026-09-10": 45200.0, "2026-09-11": 45300.0,
+        "2026-09-14": 45903.0, "2026-09-15": 45727.0, "2026-09-16": 46060.0,
+        "2026-09-17": 46459.0, "2026-09-18": 47428.0,
+    })
+    out = dump._chain_changes("taiex", "TX10AM", q, date(2026, 9, 21),
+                              entry, "TAIFEX,TX10AM")
+    assert round(out["daily_pct"], 4) == 2.0857
+    assert out["weekly_pct"] is not None, "鏈上有 7 天以外的結算就該算得出週漲跌"
+    assert round(out["weekly_pct"], 4) == round((47428.0 / 45300.0 - 1) * 100, 4)
