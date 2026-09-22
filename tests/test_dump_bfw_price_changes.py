@@ -712,3 +712,82 @@ def test_seeded_chain_also_unblocks_the_weekly_change():
     assert round(out["daily_pct"], 4) == 2.0857
     assert out["weekly_pct"] is not None, "鏈上有 7 天以外的結算就該算得出週漲跌"
     assert round(out["weekly_pct"], 4) == round((47428.0 / 45300.0 - 1) * 100, 4)
+
+
+# ---------------------------------------------------------------- 新鮮度由本端判定（2026-09-22 驗收後新增）
+#
+# 前一版把「這個值是不是最後一個交易日的」外包給下游 scraper 的多數決
+# （同一份價格檔裡誰的 last_date 比較舊）。2026-09-22 的對抗式驗收推翻了那個設計：
+# 下游分不出「上游壞了」與「這個市場今天放假」，於是
+#   - 台指期 2026-09-25／09-28 休市 ⇒ 09-26~09-29 連四份報告的**正確值**會被清空；
+#   - 反過來「美盤休市隔天」多數商品自己也落後 ⇒ 多數決跟著移動 ⇒ **錯值被放行**。
+#
+# 現在改由本端判：官方行情自己的最大日期就是交易所認定的最後一個交易日
+# （休市日它根本不發資料），不需要任何交易日曆。
+
+
+def _se(last_date, daily=1.0):
+    return {"daily_pct": daily, "weekly_pct": None, "last_date": last_date,
+            "last_close": 1.0, "series": "TAIFEX,TX10AM", "resolve": "x"}
+
+
+def test_official_last_trading_day_skips_exchange_holidays_without_a_calendar():
+    """休市日不會出現在官方行情裡 ⇒ 最大日期天生就是最後一個交易日。"""
+    official = {"202610": {"2026-09-23": 1.0, "2026-09-24": 2.0}}   # 09-25 休市，沒有那天
+    assert dump._official_last_trading_day(official, "202610") == "2026-09-24"
+    assert dump._official_last_trading_day(official, "202611") is None
+    assert dump._official_last_trading_day({}, "202610") is None
+
+
+def test_taiwan_holiday_does_not_blank_a_correct_value():
+    """🔴 前一版會在這裡誤殺。2026-09-26 的報告：台指期最後交易日是 09-24
+    （09-25 期交所休市），海外是 09-25 —— 兩邊都對，只是不同天。
+
+    本端的判準只跟**期交所自己**比，所以不受海外那 41 檔影響。
+    """
+    official_last = "2026-09-24"
+    assert dump._freshness_problem(_se("2026-09-24"), official_last) is None
+
+
+def test_chain_lagging_behind_the_exchange_is_blanked():
+    """鏈沒跟上 ⇒ 明確是舊的 ⇒ 留空。這正是 09-17~09-21 連 5 天發錯的形狀。"""
+    why = dump._freshness_problem(_se("2026-09-18"), "2026-09-21")
+    assert why and "2026-09-18" in why and "2026-09-21" in why
+
+
+def test_cannot_reach_the_exchange_is_blanked_not_guessed():
+    """官方行情取不到 ⇒ 無法確認 ⇒ 留空。
+
+    🔴 不可以退回快照值：盤前的快照鏈**結構上**就落後一個交易日，
+    「不能確認」在這條路上實質等於「很可能是舊的」。
+    """
+    why = dump._freshness_problem(_se("2026-09-18"), None)
+    assert why and "無法向期交所確認" in why
+
+
+def test_fake_node_on_a_holiday_is_blanked():
+    """連假後盤中重跑會在休市日長出假節點並算出 +0.00%，這道尺擋得住。
+
+    實例：2026-09-29 15:00 重跑 → settle_date=09-28（TAIFEX 休市）、daily=0.0，
+    而官方的最後交易日是 09-24 ⇒ 不符 ⇒ 留空。
+    與 2026-09-16 那次「+0.00% 假平盤」同型（同一個數字當分子又當分母）。
+    """
+    why = dump._freshness_problem(_se("2026-09-28", daily=0.0), "2026-09-24")
+    assert why and "2026-09-28" in why
+
+
+def test_freshness_check_is_actually_wired_into_run_domestic():
+    """🔴 保護沒被呼叫等於不存在 —— 用 AST 確認 `_run_domestic` 真的呼叫了它。
+
+    這條測試存在的理由：本 workspace 出過「守衛加了卻沒有任何呼叫點」的前例。
+    """
+    import ast as _ast
+    import pathlib
+    src = pathlib.Path(dump.__file__).read_text(encoding='utf-8')
+    tree = _ast.parse(src)
+    fn = next(n for n in _ast.walk(tree)
+              if isinstance(n, _ast.FunctionDef) and n.name == '_run_domestic')
+    called = {n.func.id for n in _ast.walk(fn)
+              if isinstance(n, _ast.Call) and isinstance(n.func, _ast.Name)}
+    assert '_freshness_problem' in called, called
+    assert '_official_last_trading_day' in called, called

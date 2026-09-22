@@ -781,6 +781,45 @@ def _taifex_official_settles(root: str, as_of: _date, *,
     return out
 
 
+def _official_last_trading_day(official: dict, month):
+    """官方行情自己說的「as_of 之前最後一個有結算價的交易日」。查不到回 None。
+
+    🔴 這是一把**不需要交易日曆**的新鮮度尺：交易所休市日根本不會發布行情，
+    所以 `official` 裡的最大日期天生就是它自己認定的最後一個交易日。
+    2026-09-25／09-28 台指期休市那幾天，這裡會回 09-24，而鏈算出來的也是 09-24
+    ⇒ 相符、不留空；同一天海外照常開在 09-25，但那與本商品無關。
+    """
+    days = (official or {}).get(month) or {}
+    return max(days) if days else None
+
+
+def _freshness_problem(se: dict, official_last):
+    """回「這個值不是最後一個交易日的」的理由；沒問題回 None。
+
+    兩種情形都要擋，理由不同：
+    - **拿不到 `official_last`** ⇒ 無法確認。而快照那條路在台股開盤前**結構上**
+      就落後一個交易日（檔頭那張實測表），所以「不能確認」實質等於「很可能是舊的」。
+    - **拿得到但與算出來的日期不符** ⇒ 鏈沒跟上，明確是舊的。
+
+    🔴 這一條同時擋掉「連假後盤中重跑在休市日長出假節點」那個形狀：
+    2026-09-29 15:00 重跑會算出 settle_date=09-28（TAIFEX 休市日）、daily=+0.00%，
+    而 `official_last` 是 09-24 ⇒ 不符 ⇒ 留空。與 2026-09-16 那次 +0.00% 假平盤同型。
+
+    🔴 判斷放在**上游**而不是下游，是 2026-09-22 驗收推翻前一版設計後的結論：
+    下游只看得到「一份價格檔裡誰的日期比較舊」，分不出「上游壞了」與「這個市場放假」
+    ——台指期 09-25／09-28 休市時，下游的多數決會把**正確**的值當成陳舊清掉。
+    只有這一端知道交易所到底有沒有發布那一天。
+    """
+    last = se.get("last_date")
+    if official_last is None:
+        return ("無法向期交所確認最後一個交易日（官方行情取不到）"
+                f"；快照算出的是 {last}，盤前的快照鏈結構上會落後一個交易日")
+    if last != official_last:
+        return (f"算出的盤面日 {last} 不是期交所最後一個交易日 {official_last}"
+                "（結算鏈沒跟上）")
+    return None
+
+
 def _domestic_contract_month(catalog: list, code: str):
     """由商品清單的最後交易日推出契約月 `YYYYMM`。查不到回 None。
 
@@ -1012,6 +1051,22 @@ def _run_domestic(as_of: _date, settle_state: dict, prices: dict,
             entry["active_code"] = front
             _prune_entry(entry, {c for c in (front, nxt) if c}, as_of)
             entry["updated"] = datetime.now().isoformat(timespec="seconds")
+
+            # 🔴 新鮮度由**本端**判定（2026-09-22）。判準是官方行情自己的最大日期，
+            # 不是交易日曆、也不是下游那份價格檔的多數決——後者在單一市場休市時
+            # 會把正確的值當成陳舊清掉（台指期 09-25／09-28 休市即會發生）。
+            front_month = _domestic_contract_month(catalog, front)
+            official_last = _official_last_trading_day(official, front_month)
+            fresh_problem = (None if se["daily_pct"] is None
+                             else _freshness_problem(se, official_last))
+            if fresh_problem:
+                print(f"   🔴 {key}：{fresh_problem} → 留空")
+                problems.append(f"{key}（新鮮度：{fresh_problem}）")
+                prices[key] = {
+                    "daily_pct": None, "weekly_pct": None, "series": series,
+                    "resolve": f"{root} 近月 {front}；{fresh_problem} → 留空",
+                }
+                continue
 
             name = (snap or {}).get("name", "")
             note = f"{root} 近月 {front}（{name}）候選 {front}/{nxt or '—'}"
