@@ -18,6 +18,8 @@ from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 REPO = Path(__file__).resolve().parent.parent
 _spec = importlib.util.spec_from_file_location(
     "dump_bfw_price_changes", REPO / "scripts" / "dump_bfw_price_changes.py")
@@ -806,7 +808,29 @@ def test_freshness_check_is_actually_wired_into_run_domestic():
 # --tag 20261124`，擷取檔 gitignored）。下面這幾列是那份擷取檔「含下單代碼」區塊的原文，
 # 逐字照抄（已用子字串比對確認 19 列都在擷取檔裡）；MNQ（微型）一起放進來，確認 root 比對
 # 不會把它吃成那斯達克100。
-# ⚠️ 本節期望值一律寫死，不從被測模組的常數反推。
+# ⚠️ 本節期望值一律寫死，不從被測模組的常數反推。下面的 `_fake_world` 會照被測模組的
+#    對照表替其他商品造假商品檔與快照——那是**輸入**；期望的鍵集合寫死在
+#    `_EXPECTED_*` 幾個常數裡（2026-11-18 覆核：原本 main() 那條的期望鍵也從對照表推，
+#    多加一檔商品會一路綠）。
+
+# 各對照表的鍵（＝價格檔的鍵），寫死。main 357ef3a 的 FUTURES_HOT 31 個＋本批 2 個。
+# 🔴 這一批只加黃豆粉、那斯達克100；鎳、費半等 user 看重查結果再定 ⇒ 任何一張表多出或
+#    少掉一個鍵都要紅。日後真的要加商品時，連同這裡一起改（並寫明 user 同意的日期）。
+_EXPECTED_FUTURES_HOT_KEYS = {
+    "brent_crude", "wti_crude", "wheat", "corn", "soybean", "soybean_oil", "copper", "gold",
+    "silver", "rubber", "sugar", "live_cattle", "coffee", "rough_rice", "cotton", "cocoa",
+    "lean_hog", "orange_juice", "oats", "dollar_index", "ust_10y", "palladium", "platinum",
+    "heating_oil", "natural_gas", "rbob_gasoline", "feeder_cattle",
+    "sp500", "dow", "hang_seng_tech", "ftse_a50",
+    "soybean_meal", "nasdaq100",            # 2026-11-18 新增
+}
+_EXPECTED_SETTLE_CHAIN = {"aluminum": ("NYM", "ALI")}
+_EXPECTED_SPOT_KEYS = {"jpy", "gbp", "eur", "chf", "cad", "aud"}
+_EXPECTED_SPOT_INDEX_KEYS = {"nikkei", "kospi", "hang_seng"}
+_EXPECTED_DOMESTIC_KEYS = {"taiex"}
+# 整支 main() 的價格檔鍵：國內線（taiex）在測試裡被換掉，所以不在裡面 ⇒ 33＋1＋6＋3＝43
+_EXPECTED_OVERSEAS_PRICE_KEYS = (_EXPECTED_FUTURES_HOT_KEYS | set(_EXPECTED_SETTLE_CHAIN)
+                                 | _EXPECTED_SPOT_KEYS | _EXPECTED_SPOT_INDEX_KEYS)
 
 CAPTURE_1118_DETAIL = [
     "CBOT,芝加哥期貨交易所,SM0000,黃豆粉熱2612,CBT,SM_202612,20261214,20261130,5",
@@ -844,8 +868,17 @@ def test_new_commodities_are_in_the_futures_table():
     # 既有的美股兩檔不受影響
     assert dump.FUTURES_HOT["sp500"] == ("CME", "ES0000")
     assert dump.FUTURES_HOT["dow"] == ("CBOT", "YM0000")
-    # 鎳、費半這一批不加（等 user 看重查結果再定）
-    assert not {"nickel", "sox", "philly_semi"} & set(dump.FUTURES_HOT)
+    # 鎳、費半這一批不加（等 user 看重查結果再定）。
+    # 只擋幾個固定名字不夠（2026-11-18 覆核的突變：鎳比照鋁加進 SETTLE_CHAIN、或換個鍵名
+    # lme_nickel 加進 FUTURES_HOT，全套照樣綠）⇒ 每一張表都比對寫死的整份鍵集合。
+    assert set(dump.FUTURES_HOT) == _EXPECTED_FUTURES_HOT_KEYS
+    assert len(dump.FUTURES_HOT) == 33
+    assert dump.SETTLE_CHAIN == _EXPECTED_SETTLE_CHAIN
+    assert set(dump.SPOT) == _EXPECTED_SPOT_KEYS
+    assert set(dump.SPOT_INDEX) == _EXPECTED_SPOT_INDEX_KEYS
+    assert set(dump.DOMESTIC_CHAIN) == _EXPECTED_DOMESTIC_KEYS
+    assert dump.UNCOVERED == ()
+    assert len(_EXPECTED_OVERSEAS_PRICE_KEYS) == 43
 
 
 def test_new_commodities_resolve_from_the_real_catalog_lines():
@@ -856,6 +889,9 @@ def test_new_commodities_resolve_from_the_real_catalog_lines():
     # ⚠️ HOT 代碼自己（SM0000）也符合「root＋4 位數字」，而且最後交易日與它映射的月份相同，
     #    所以會排在逐月清單最前面——既有商品（C0000、ES0000…）全都一樣，是現行行為。
     #    真正選中近月的是下面的 HOT 錨（第一天沒有 state active_code，只靠它）。
+    #    🔴 已知缺陷（2026-11-18 覆核，未修、待 user 決定）：第一天只要 HOT 映射失敗，
+    #    就沒有任何錨，近月會選到 HOT 本身（換月拼接序列）——見
+    #    test_first_day_hot_mapping_failure_must_not_pick_the_hot_itself（strict xfail）。
     assert dump._hot_mapped_code(catalog, "SM0000") == "SM2612"
     sm = dump._month_codes(catalog, "SM", as_of)
     assert [c for c in sm if c != "SM0000"] == [
@@ -1031,7 +1067,12 @@ def _snap(day: int, settle: float, ref: float) -> dict:
 
 
 def test_price_file_gets_both_new_keys_on_the_first_day(monkeypatch, tmp_path):
-    """第一天（鏈上沒有昨結）：06:30 時點 nRef 是真昨結 ⇒ 日漲跌照結算鏈出值，週漲跌用最後成交過渡。"""
+    """第一天（鏈上沒有昨結）、假設快照 nRef 是真昨結（≠ settle）⇒ 日漲跌照結算鏈出值、
+    週漲跌用最後成交過渡。
+
+    ⚠️ 「06:30 時點 nRef 是真昨結」對這兩檔**沒有實測**（見 dump 對照表 soybean_meal 上方
+    註解）；這條只證明程式照那個假設走。nRef 被改寫成 settle 的情況見下一條。
+    """
     world = _fake_world(20261123, {
         "SM2612": _snap(20261123, settle=310.5, ref=305.0),
         "SM2701": _snap(20261123, settle=312.0, ref=306.0),
@@ -1040,9 +1081,8 @@ def test_price_file_gets_both_new_keys_on_the_first_day(monkeypatch, tmp_path):
     })
     prices = _run_main(monkeypatch, tmp_path, "2026-11-24", world)
 
-    expected_keys = (set(dump.FUTURES_HOT) | set(dump.SETTLE_CHAIN)
-                     | set(dump.SPOT) | set(dump.SPOT_INDEX))
-    assert set(prices) == expected_keys
+    # 期望鍵寫死（不從對照表推）：多加一檔商品，價格檔就會多一個鍵 ⇒ 這裡紅
+    assert set(prices) == _EXPECTED_OVERSEAS_PRICE_KEYS
     assert {"soybean_meal", "nasdaq100"} <= set(prices)
 
     sm = prices["soybean_meal"]
@@ -1107,3 +1147,51 @@ def test_second_day_uses_the_settlement_chain(monkeypatch, tmp_path):
     assert "日=結算鏈" in sm["resolve"]
     nq = prices["nasdaq100"]
     assert nq["daily_pct"] == 0.5               # 21105 / 21000 - 1
+
+
+class _KnownDefectPicksHot(AssertionError):
+    """下一條已知缺陷專用的例外：xfail 只收這一種，其他斷言失敗照樣紅。"""
+
+
+@pytest.mark.xfail(
+    strict=True, raises=_KnownDefectPicksHot,
+    reason="已知缺陷（2026-11-18 覆核，未修）：第一天 HOT 映射失敗時近月選到 HOT 本身；"
+           "修法會動到所有商品的選月，超出日報第 7 點範圍，待 user 決定")
+def test_first_day_hot_mapping_failure_must_not_pick_the_hot_itself(monkeypatch, tmp_path):
+    """第一天（state 沒有 active_code）而 HOT 下單代碼解析不了：快照與日K 都不可以抓 HOT 本身。
+
+    現況：`_month_codes` 的「root＋4 位數字」也比中 SM0000／NQ0000，而且 HOT 的最後交易日
+    與它映射的月份相同、代碼字母序又比較前 ⇒ 排第一；沒有任何錨時 `_pick_candidates`
+    就選它。既有商品有 state 的錨，所以只有新商品的第一天會露出來；用 11-18 的商品檔
+    不會觸發（SM_202612、NQ_202612 都解析得了）。畫面上還會印「→ 改用 LTD 近月」，
+    實際選的卻是 HOT。
+    🔴 strict：哪天修好了，這條會變 XPASS 而紅 ⇒ 到時候把 xfail 拿掉，讓它當一般測試守住。
+    """
+    world = _fake_world(20261123, {
+        "SM2612": _snap(20261123, settle=310.5, ref=305.0),
+        "NQ2612": _snap(20261123, settle=21000.0, ref=20790.0),
+    })
+    # 把兩個 HOT 的下單代碼改成解析不了的形狀（少了底線），其餘原文不動
+    broken = {"SM0000": ("SM_202612", "SM202612"), "NQ0000": ("NQ_202612", "NQ202612")}
+    patched = []
+    for line in world._detail:
+        code = line.split(",")[2]
+        if code in broken:
+            old, new = broken[code]
+            assert f",{old}," in line
+            line = line.replace(f",{old},", f",{new},", 1)
+        patched.append(line)
+    world._detail = patched
+    # 前提：真的走到「映射失敗」那條路（不然這條測的不是它）
+    catalog = dump._parse_detail(world._detail)
+    assert dump._hot_mapped_code(catalog, "SM0000") is None
+    assert dump._hot_mapped_code(catalog, "NQ0000") is None
+
+    prices = _run_main(monkeypatch, tmp_path, "2026-11-24", world)
+
+    picked = [t for t in ("CBOT,SM0000", "CME,NQ0000")
+              if t in world.snapshot_targets or t in world.kline_targets]
+    if picked:
+        raise _KnownDefectPicksHot(f"第一天 HOT 映射失敗時抓了 HOT 本身：{picked}")
+    assert prices["soybean_meal"]["series"] == "CBOT,SM2612"
+    assert prices["nasdaq100"]["series"] == "CME,NQ2612"
