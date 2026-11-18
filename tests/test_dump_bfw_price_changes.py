@@ -256,6 +256,27 @@ class TestMonthCodesAndCandidates:
         months = ["OJF2611", "OJF2701"]
         assert dump._pick_candidates(months, ["OJF2609", "OJF2609"]) == ("OJF2611", "OJF2701")
 
+    @pytest.mark.parametrize("hot_order_code, hot_ltd", [
+        ("OJ_202609", "20260910"),   # HOT 指近月：LTD 與 OJF2609 相同、代碼字母序較前 ⇒ 修前排第一
+        ("OJ_202611", "20261110"),   # HOT 指次月（咖啡 11-18 實況）⇒ 修前夾在近月與次月中間
+    ])
+    def test_hot_code_itself_is_never_a_month(self, hot_order_code, hot_ltd):
+        """HOT（root＋0000）也符合「root＋4 位數字」，但它是換月拼接序列、不是月份合約
+        ⇒ 不進逐月清單；沒有錨（新商品第一天＋HOT 映射失敗）時選到的是真正的近月／次月。
+
+        群益商品檔的 HOT 列，最後交易日照抄它當下指向的月份（2026-11-18 擷取檔實況）。
+        修前（2026-11-18 覆核發現）：第一列的情況近月選到 OJF0000，第二列的情況次月選到 OJF0000。
+        """
+        catalog = dict(self.CATALOG)
+        catalog["OJF0000"] = {"exch": "ICEUS", "name": "OJ HOT", "order_code": hot_order_code,
+                              "ltd": hot_ltd}
+        months = dump._month_codes(catalog, "OJF", self.AS_OF)
+        assert months == ["OJF2609", "OJF2611", "OJF2701"]
+        assert "OJF0000" not in months
+        assert dump._pick_candidates(months, [None, None]) == ("OJF2609", "OJF2611")
+        # 有 state 錨、HOT 映射失敗：次月也不可以是 HOT
+        assert dump._pick_candidates(months, ["OJF2609", None]) == ("OJF2609", "OJF2611")
+
 
 # ---------------------------------------------------------------- 任務 3：state schema 遷移/修剪
 
@@ -886,24 +907,26 @@ def test_new_commodities_resolve_from_the_real_catalog_lines():
     catalog = dump._parse_detail(CAPTURE_1118_DETAIL)
     as_of = date(2026, 11, 24)
 
-    # ⚠️ HOT 代碼自己（SM0000）也符合「root＋4 位數字」，而且最後交易日與它映射的月份相同，
-    #    所以會排在逐月清單最前面——既有商品（C0000、ES0000…）全都一樣，是現行行為。
-    #    真正選中近月的是下面的 HOT 錨（第一天沒有 state active_code，只靠它）。
-    #    🔴 已知缺陷（2026-11-18 覆核，未修、待 user 決定）：第一天只要 HOT 映射失敗，
-    #    就沒有任何錨，近月會選到 HOT 本身（換月拼接序列）——見
-    #    test_first_day_hot_mapping_failure_must_not_pick_the_hot_itself（strict xfail）。
+    # HOT 代碼自己（SM0000）也符合「root＋4 位數字」，而且最後交易日與它映射的月份相同；
+    # 2026-11-19 修正前它會排在逐月清單最前面，第一天 HOT 映射失敗（沒有任何錨）時近月就選到
+    # HOT 本身（換月拼接序列）。現在逐月清單不收 root＋0000（2026-11-18 覆核發現、user 11-19 同意修）。
     assert dump._hot_mapped_code(catalog, "SM0000") == "SM2612"
     sm = dump._month_codes(catalog, "SM", as_of)
-    assert [c for c in sm if c != "SM0000"] == [
+    assert sm == [
         "SM2612", "SM2701", "SM2703", "SM2705", "SM2707", "SM2708", "SM2709", "SM2710", "SM2712"]
+    assert "SM0000" not in sm
     assert dump._pick_candidates(sm, [None, "SM2612"]) == ("SM2612", "SM2701")
+    # 第一天、HOT 映射失敗（沒有 state 錨也沒有 HOT 錨）⇒ 仍是真正的近月／次月
+    assert dump._pick_candidates(sm, [None, None]) == ("SM2612", "SM2701")
 
     assert dump._hot_mapped_code(catalog, "NQ0000") == "NQ2612"
     nq = dump._month_codes(catalog, "NQ", as_of)
-    # 價差 NQ2612/2703 與微型 MNQ 都不可以混進來
-    assert [c for c in nq if c != "NQ0000"] == ["NQ2612", "NQ2703", "NQ2706"]
+    # 價差 NQ2612/2703、微型 MNQ、HOT NQ0000 都不可以混進來
+    assert nq == ["NQ2612", "NQ2703", "NQ2706"]
+    assert "NQ0000" not in nq
     assert not [c for c in nq if "/" in c or c.startswith("MNQ")]
     assert dump._pick_candidates(nq, [None, "NQ2612"]) == ("NQ2612", "NQ2703")
+    assert dump._pick_candidates(nq, [None, None]) == ("NQ2612", "NQ2703")
 
 
 # ---- 不登入群益的整支 main()：假的 COM 元件＋假時鐘 ----
@@ -1149,29 +1172,8 @@ def test_second_day_uses_the_settlement_chain(monkeypatch, tmp_path):
     assert nq["daily_pct"] == 0.5               # 21105 / 21000 - 1
 
 
-class _KnownDefectPicksHot(AssertionError):
-    """下一條已知缺陷專用的例外：xfail 只收這一種，其他斷言失敗照樣紅。"""
-
-
-@pytest.mark.xfail(
-    strict=True, raises=_KnownDefectPicksHot,
-    reason="已知缺陷（2026-11-18 覆核，未修）：第一天 HOT 映射失敗時近月選到 HOT 本身；"
-           "修法會動到所有商品的選月，超出日報第 7 點範圍，待 user 決定")
-def test_first_day_hot_mapping_failure_must_not_pick_the_hot_itself(monkeypatch, tmp_path):
-    """第一天（state 沒有 active_code）而 HOT 下單代碼解析不了：快照與日K 都不可以抓 HOT 本身。
-
-    現況：`_month_codes` 的「root＋4 位數字」也比中 SM0000／NQ0000，而且 HOT 的最後交易日
-    與它映射的月份相同、代碼字母序又比較前 ⇒ 排第一；沒有任何錨時 `_pick_candidates`
-    就選它。既有商品有 state 的錨，所以只有新商品的第一天會露出來；用 11-18 的商品檔
-    不會觸發（SM_202612、NQ_202612 都解析得了）。畫面上還會印「→ 改用 LTD 近月」，
-    實際選的卻是 HOT。
-    🔴 strict：哪天修好了，這條會變 XPASS 而紅 ⇒ 到時候把 xfail 拿掉，讓它當一般測試守住。
-    """
-    world = _fake_world(20261123, {
-        "SM2612": _snap(20261123, settle=310.5, ref=305.0),
-        "NQ2612": _snap(20261123, settle=21000.0, ref=20790.0),
-    })
-    # 把兩個 HOT 的下單代碼改成解析不了的形狀（少了底線），其餘原文不動
+def _break_hot_mapping(world: _FakeOSLib) -> None:
+    """把 SM0000、NQ0000 的下單代碼改成解析不了的形狀（少了底線），其餘原文不動。"""
     broken = {"SM0000": ("SM_202612", "SM202612"), "NQ0000": ("NQ_202612", "NQ202612")}
     patched = []
     for line in world._detail:
@@ -1182,16 +1184,68 @@ def test_first_day_hot_mapping_failure_must_not_pick_the_hot_itself(monkeypatch,
             line = line.replace(f",{old},", f",{new},", 1)
         patched.append(line)
     world._detail = patched
-    # 前提：真的走到「映射失敗」那條路（不然這條測的不是它）
+    # 前提：真的走到「映射失敗」那條路（不然測的不是它）
     catalog = dump._parse_detail(world._detail)
     assert dump._hot_mapped_code(catalog, "SM0000") is None
     assert dump._hot_mapped_code(catalog, "NQ0000") is None
 
-    prices = _run_main(monkeypatch, tmp_path, "2026-11-24", world)
 
-    picked = [t for t in ("CBOT,SM0000", "CME,NQ0000")
-              if t in world.snapshot_targets or t in world.kline_targets]
-    if picked:
-        raise _KnownDefectPicksHot(f"第一天 HOT 映射失敗時抓了 HOT 本身：{picked}")
+def test_first_day_hot_mapping_failure_must_not_pick_the_hot_itself(monkeypatch, tmp_path, capsys):
+    """第一天（state 沒有 active_code）而 HOT 下單代碼解析不了：近月／次月是真正的月份合約，
+    快照與日K 都不可以抓 HOT 本身。
+
+    2026-11-18 覆核發現、user 11-19 同意修：`_month_codes` 的「root＋4 位數字」原本也比中
+    SM0000／NQ0000，而且 HOT 的最後交易日與它映射的月份相同、代碼字母序又比較前 ⇒ 排第一；
+    沒有任何錨時 `_pick_candidates` 就選它（換月拼接序列），畫面卻印「→ 改用 LTD 近月」。
+    既有商品有 state 的錨，所以只有新商品的第一天會露出來。現在逐月清單不收 root＋0000。
+    """
+    world = _fake_world(20261123, {
+        "SM2612": _snap(20261123, settle=310.5, ref=305.0),
+        "NQ2612": _snap(20261123, settle=21000.0, ref=20790.0),
+    })
+    _break_hot_mapping(world)
+
+    prices = _run_main(monkeypatch, tmp_path, "2026-11-24", world)
+    out = capsys.readouterr().out
+
+    for hot in ("CBOT,SM0000", "CME,NQ0000"):
+        assert hot not in world.snapshot_targets and hot not in world.kline_targets
+    # 近月與次月（寫死，取自 11-18 商品檔原文：SM2612 LTD 20261214、SM2701 20270114；
+    # NQ2612 20261218、NQ2703 20270319）
+    for target in ("CBOT,SM2612", "CBOT,SM2701", "CME,NQ2612", "CME,NQ2703"):
+        assert target in world.snapshot_targets and target in world.kline_targets
     assert prices["soybean_meal"]["series"] == "CBOT,SM2612"
+    assert prices["nasdaq100"]["series"] == "CME,NQ2612"
+    state = json.loads((tmp_path / "bfw_settle_state.json").read_text(encoding="utf-8"))
+    assert state["soybean_meal"]["active_code"] == "SM2612"
+    assert set(state["soybean_meal"]["chains"]) == {"SM2612", "SM2701"}
+    assert state["nasdaq100"]["active_code"] == "NQ2612"
+    assert set(state["nasdaq100"]["chains"]) == {"NQ2612", "NQ2703"}
+    # 畫面上的說明與實際選擇一致
+    assert "HOT SM0000 映射失敗（order_code=SM202612）→ 改用 LTD 近月 SM2612" in out
+    assert "HOT NQ0000 映射失敗（order_code=NQ202612）→ 改用 LTD 近月 NQ2612" in out
+
+
+def test_hot_mapping_failure_with_a_state_anchor_says_it_kept_the_last_contract(
+        monkeypatch, tmp_path, capsys):
+    """第二天 HOT 映射失敗、state 已有上次的報導合約：沿用它，畫面也照實說是沿用（不是「LTD 近月」）。"""
+    _run_main(monkeypatch, tmp_path, "2026-11-24", _fake_world(20261123, {
+        "SM2612": _snap(20261123, settle=310.5, ref=305.0),
+        "NQ2612": _snap(20261123, settle=21000.0, ref=20790.0),
+    }))
+    capsys.readouterr()
+    world = _fake_world(20261124, {
+        "SM2612": _snap(20261124, settle=314.0, ref=311.0),
+        "NQ2612": _snap(20261124, settle=21105.0, ref=21000.0),
+    })
+    _break_hot_mapping(world)
+    prices = _run_main(monkeypatch, tmp_path, "2026-11-25", world)
+    out = capsys.readouterr().out
+
+    assert "HOT SM0000 映射失敗（order_code=SM202612）→ 沿用上次的報導合約 SM2612" in out
+    assert "HOT NQ0000 映射失敗（order_code=NQ202612）→ 沿用上次的報導合約 NQ2612" in out
+    for hot in ("CBOT,SM0000", "CME,NQ0000"):
+        assert hot not in world.snapshot_targets and hot not in world.kline_targets
+    assert prices["soybean_meal"]["series"] == "CBOT,SM2612"
+    assert prices["soybean_meal"]["daily_pct"] == 1.1272      # 314 / 310.5 - 1（鏈接上了）
     assert prices["nasdaq100"]["series"] == "CME,NQ2612"

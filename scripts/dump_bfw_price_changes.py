@@ -399,10 +399,18 @@ def _month_codes(catalog: dict[str, dict], quote_root: str, as_of: _date) -> lis
 
     比對沿用「報價 root + 4 位數字」fullmatch（與舊 _chain_front_contract 同款；
     刻意不比對交易所欄——catalog 的 exch 欄格式未經驗證，錯比會整批落空）。
+
+    🔴 HOT 代碼本身（root＋0000，如 SM0000、C0000）也符合「root＋4 位數字」，但它是換月
+    拼接序列、不是月份合約（月份 00 不存在），一律排除。2026-11-19 修正前它會混進清單：
+    群益商品檔的 HOT 列照抄它指向那個月的最後交易日、代碼字母序又較前 ⇒ 排在那個月前面。
+    HOT 映射成功時錨（映射月）排在 HOT 後面，選不到它；映射失敗時就可能選到：新商品第一天
+    （state 沒有 active_code）近月會是 HOT；HOT 已指到比 state 錨更晚的月份時次月會是 HOT。
+    修正只改變這些「原本選到 HOT」的結果（11-18、08-26 兩份商品擷取檔逐鍵比對過）。
     """
+    hot_code = quote_root + "0000"
     out: list[tuple[str, str]] = []
     for code, rec in catalog.items():
-        if not re.fullmatch(re.escape(quote_root) + r"\d{4}", code):
+        if code == hot_code or not re.fullmatch(re.escape(quote_root) + r"\d{4}", code):
             continue
         ltd = rec.get("ltd", "")
         if not re.fullmatch(r"\d{8}", ltd) or ltd in ("0", "99991231"):
@@ -1180,11 +1188,14 @@ def main() -> int:
                 print(f"   ⚠️ {key}: {resolve_failed[key]}")
                 return
             hot_mapped = _hot_mapped_code(catalog, hot) if hot else None
-            if hot and not hot_mapped:
-                print(f"   ⚠️ {key}: HOT {hot} 映射失敗"
-                      f"（order_code={catalog.get(hot, {}).get('order_code')}）→ 改用 LTD 近月")
             prev_active = settle_state.get(key, {}).get("active_code")
             front, nxt = _pick_candidates(months, [prev_active, hot_mapped])
+            if hot and not hot_mapped:
+                # 只剩 state 錨：錨還在候選裡就沿用它，否則（沒有錨／錨已過期）取 LTD 最早的月份
+                how = (f"沿用上次的報導合約 {front}" if prev_active == front
+                       else f"改用 LTD 近月 {front}")
+                print(f"   ⚠️ {key}: HOT {hot} 映射失敗"
+                      f"（order_code={catalog.get(hot, {}).get('order_code')}）→ {how}")
             hot_tag = f"HOT {hot}→{hot_mapped or '?'} " if hot else ""
             plan[key] = (exch, front, f"{hot_tag}候選 {front}/{nxt or '—'}")
             candidates[key] = (front, nxt)
