@@ -1197,7 +1197,8 @@ def test_first_day_hot_mapping_failure_must_not_pick_the_hot_itself(monkeypatch,
     2026-11-18 覆核發現、user 11-19 同意修：`_month_codes` 的「root＋4 位數字」原本也比中
     SM0000／NQ0000，而且 HOT 的最後交易日與它映射的月份相同、代碼字母序又比較前 ⇒ 排第一；
     沒有任何錨時 `_pick_candidates` 就選它（換月拼接序列），畫面卻印「→ 改用 LTD 近月」。
-    既有商品有 state 的錨，所以只有新商品的第一天會露出來。現在逐月清單不收 root＋0000。
+    既有商品平常有 state 的錨，新商品第一天最容易露出來；但既有商品在錨被 LTD 濾掉的那天、
+    或 HOT 剛好指到錨的下一個月份時也會（見 `_month_codes` docstring）。現在逐月清單不收 root＋0000。
     """
     world = _fake_world(20261123, {
         "SM2612": _snap(20261123, settle=310.5, ref=305.0),
@@ -1249,3 +1250,47 @@ def test_hot_mapping_failure_with_a_state_anchor_says_it_kept_the_last_contract(
     assert prices["soybean_meal"]["series"] == "CBOT,SM2612"
     assert prices["soybean_meal"]["daily_pct"] == 1.1272      # 314 / 310.5 - 1（鏈接上了）
     assert prices["nasdaq100"]["series"] == "CME,NQ2612"
+
+
+def test_hot_mapping_failure_with_an_expired_state_anchor_says_it_moved_to_the_ltd_front(
+        monkeypatch, tmp_path, capsys):
+    """HOT 映射失敗、state 錨已過期（LTD < as_of+3，被逐月清單濾掉）：近月取 LTD 最早的可用月份，
+    畫面要說「改用 LTD 近月」，不可以說「沿用上次的報導合約」。
+
+    2026-11-19 覆核的突變：把沿用條件 `prev_active == front` 改成 `prev_active`（錨已過期也說
+    「沿用」），原本全套照樣綠——前兩條只涵蓋「沒有錨」與「錨還有效」。
+    同一天兩種情況並存（日期與 LTD 寫死，取自 11-18 商品檔原文）：as_of 2026-12-15 ⇒ as_of+3＝12-18；
+    SM2612 LTD 20261214 < 12-18 ⇒ 錨過期、近月改 SM2701；NQ2612 LTD 20261218 不小於 12-18 ⇒ 錨仍有效、沿用。
+    """
+    _run_main(monkeypatch, tmp_path, "2026-11-24", _fake_world(20261123, {
+        "SM2612": _snap(20261123, settle=310.5, ref=305.0),
+        "NQ2612": _snap(20261123, settle=21000.0, ref=20790.0),
+    }))
+    state = json.loads((tmp_path / "bfw_settle_state.json").read_text(encoding="utf-8"))
+    # 前提：第二次執行時 state 錨是這兩個（不然測的不是「錨已過期」）
+    assert state["soybean_meal"]["active_code"] == "SM2612"
+    assert state["nasdaq100"]["active_code"] == "NQ2612"
+    capsys.readouterr()
+    world = _fake_world(20261214, {
+        "SM2701": _snap(20261214, settle=320.0, ref=318.0),
+        "NQ2612": _snap(20261214, settle=21300.0, ref=21250.0),
+    })
+    _break_hot_mapping(world)
+    prices = _run_main(monkeypatch, tmp_path, "2026-12-15", world)
+    out = capsys.readouterr().out
+
+    assert "HOT SM0000 映射失敗（order_code=SM202612）→ 改用 LTD 近月 SM2701" in out
+    assert "沿用上次的報導合約 SM" not in out
+    assert "HOT NQ0000 映射失敗（order_code=NQ202612）→ 沿用上次的報導合約 NQ2612" in out
+    for hot in ("CBOT,SM0000", "CME,NQ0000"):
+        assert hot not in world.snapshot_targets and hot not in world.kline_targets
+    # 過期的錨不再訂；近月／次月改成 SM2701／SM2703
+    assert "CBOT,SM2612" not in world.snapshot_targets
+    for target in ("CBOT,SM2701", "CBOT,SM2703"):
+        assert target in world.snapshot_targets and target in world.kline_targets
+    assert prices["soybean_meal"]["series"] == "CBOT,SM2701"
+    assert "滾月(LTD/錨) SM2612→SM2701" in prices["soybean_meal"]["resolve"]
+    assert prices["nasdaq100"]["series"] == "CME,NQ2612"
+    state = json.loads((tmp_path / "bfw_settle_state.json").read_text(encoding="utf-8"))
+    assert state["soybean_meal"]["active_code"] == "SM2701"
+    assert state["nasdaq100"]["active_code"] == "NQ2612"

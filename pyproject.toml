@@ -47,3 +47,6 @@ packages = ["src/capitalapi"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+# 任何 xfail 一旦 XPASS（已知缺陷其實修好了）就轉紅，逼人拿掉標記改成一般測試
+#（2026-11-19 覆核：沒有這項時，把 xfail 以非 strict 形式加回去全套照樣綠）
+xfail_strict = true
