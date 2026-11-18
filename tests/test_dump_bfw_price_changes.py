@@ -1,16 +1,22 @@
-"""dump_bfw_price_changes 單元測試（純函式，不碰 COM/網路/檔案系統）。
+"""dump_bfw_price_changes 單元測試（不碰 COM、不登入群益、不連網；只有 2026-11-18 那節
+跑整支 main()，狀態檔與價格檔寫到 pytest 的 tmp_path）。
 
 重點：
 - 2026-08-28 橡膠 nRef 改寫事故 regression（已收盤分支昨結必須「鏈 history 優先」）。
 - 最活絡月自動換月（成交量判準）＋候選選擇（HOT/active 錨、LTD 強制滾）。
 - 雙合約結算鏈 state schema 遷移（舊 {code, history} → {active_code, chains}）與修剪。
+- 2026-11-18 新商品（黃豆粉、那斯達克100）：對照表、真實商品檔原文列、以及換掉群益元件
+  （不登入）跑整支 main() 確認價格檔有這兩個鍵與第一天的結算過渡。
 """
 
 from __future__ import annotations
 
 import importlib.util
+import json
+import sys
 from datetime import date
 from pathlib import Path
+from types import SimpleNamespace
 
 REPO = Path(__file__).resolve().parent.parent
 _spec = importlib.util.spec_from_file_location(
@@ -791,3 +797,313 @@ def test_freshness_check_is_actually_wired_into_run_domestic():
               if isinstance(n, _ast.Call) and isinstance(n.func, _ast.Name)}
     assert '_freshness_problem' in called, called
     assert '_official_last_trading_day' in called, called
+
+
+# ---------------------------------------------------------------- 2026-11-18：日報第 7 點新商品
+#
+# 黃豆粉（CBOT SM0000）與那斯達克100（CME NQ0000，群益名稱「小那」）。
+# 依據：2026-11-18 22:07 重查群益線上商品檔（`spike_overseas_futures_a0.py --products-only
+# --tag 20261124`，擷取檔 gitignored）。下面這幾列是那份擷取檔「含下單代碼」區塊的原文，
+# 逐字照抄（已用子字串比對確認 19 列都在擷取檔裡）；MNQ（微型）一起放進來，確認 root 比對
+# 不會把它吃成那斯達克100。
+# ⚠️ 本節期望值一律寫死，不從被測模組的常數反推。
+
+CAPTURE_1118_DETAIL = [
+    "CBOT,芝加哥期貨交易所,SM0000,黃豆粉熱2612,CBT,SM_202612,20261214,20261130,5",
+    "CBOT,芝加哥期貨交易所,SM2612,黃豆粉2612,CBT,SM_202612,20261214,20261130,5",
+    "CBOT,芝加哥期貨交易所,SM2701,黃豆粉2701,CBT,SM_202701,20270114,20261231,5",
+    "CBOT,芝加哥期貨交易所,SM2703,黃豆粉2703,CBT,SM_202703,20270312,20270226,5",
+    "CBOT,芝加哥期貨交易所,SM2705,黃豆粉2705,CBT,SM_202705,20270514,20270430,5",
+    "CBOT,芝加哥期貨交易所,SM2707,黃豆粉2707,CBT,SM_202707,20270714,20270630,5",
+    "CBOT,芝加哥期貨交易所,SM2708,黃豆粉2708,CBT,SM_202708,20270813,20270730,5",
+    "CBOT,芝加哥期貨交易所,SM2709,黃豆粉2709,CBT,SM_202709,20270914,20270831,5",
+    "CBOT,芝加哥期貨交易所,SM2710,黃豆粉2710,CBT,SM_202710,20271014,20270930,5",
+    "CBOT,芝加哥期貨交易所,SM2712,黃豆粉2712,CBT,SM_202712,20271214,20271130,5",
+    "CME,芝加哥商品交易所,NQ0000,小那熱2612,CME,NQ_202612,20261218,20261218,5",
+    "CME,芝加哥商品交易所,NQ2612,小那斯達克2612,CME,NQ_202612,20261218,20261218,5",
+    "CME,芝加哥商品交易所,NQ2703,小那斯達克2703,CME,NQ_202703,20270319,20270319,5",
+    "CME,芝加哥商品交易所,NQ2706,小那斯達克2706,CME,NQ_202706,20270617,20270617,5",
+    "CME,芝加哥商品交易所,NQ2612/2703,小那斯達克價差-2612/+2703,CME,NQ_202612/202703,"
+    "20270319,20270319,6",
+    "CME,芝加哥商品交易所,MNQ0000,微小那熱2612,CME,MNQ_202612,20261218,20261218,5",
+    "CME,芝加哥商品交易所,MNQ2612,微型小那斯達克2612,CME,MNQ_202612,20261218,20261218,5",
+    "CME,芝加哥商品交易所,MNQ2703,微型小那斯達克2703,CME,MNQ_202703,20270319,20270319,5",
+    "CME,芝加哥商品交易所,MNQ2706,微型小那斯達克2706,CME,MNQ_202706,20270617,20270617,5",
+]
+
+
+def test_new_commodities_are_in_the_futures_table():
+    """對照表：鍵名對 scraper commodities.yml、交易所與代碼對群益商品檔，逐字。"""
+    assert dump.FUTURES_HOT["soybean_meal"] == ("CBOT", "SM0000")
+    assert dump.FUTURES_HOT["nasdaq100"] == ("CME", "NQ0000")
+    # 有 HOT、成交量足 ⇒ 照一般期貨走；不是鋁那種「鏈未接上也不退最後成交」的極薄合約
+    for key in ("soybean_meal", "nasdaq100"):
+        assert key not in dump.SETTLE_CHAIN
+        assert key not in dump.SPOT and key not in dump.SPOT_INDEX
+        assert key not in dump.DOMESTIC_CHAIN
+    # 既有的美股兩檔不受影響
+    assert dump.FUTURES_HOT["sp500"] == ("CME", "ES0000")
+    assert dump.FUTURES_HOT["dow"] == ("CBOT", "YM0000")
+    # 鎳、費半這一批不加（等 user 看重查結果再定）
+    assert not {"nickel", "sox", "philly_semi"} & set(dump.FUTURES_HOT)
+
+
+def test_new_commodities_resolve_from_the_real_catalog_lines():
+    """用 11-18 的原文列走一遍 main 的解析：HOT 映射、逐月清單、近月／次月候選。"""
+    catalog = dump._parse_detail(CAPTURE_1118_DETAIL)
+    as_of = date(2026, 11, 24)
+
+    # ⚠️ HOT 代碼自己（SM0000）也符合「root＋4 位數字」，而且最後交易日與它映射的月份相同，
+    #    所以會排在逐月清單最前面——既有商品（C0000、ES0000…）全都一樣，是現行行為。
+    #    真正選中近月的是下面的 HOT 錨（第一天沒有 state active_code，只靠它）。
+    assert dump._hot_mapped_code(catalog, "SM0000") == "SM2612"
+    sm = dump._month_codes(catalog, "SM", as_of)
+    assert [c for c in sm if c != "SM0000"] == [
+        "SM2612", "SM2701", "SM2703", "SM2705", "SM2707", "SM2708", "SM2709", "SM2710", "SM2712"]
+    assert dump._pick_candidates(sm, [None, "SM2612"]) == ("SM2612", "SM2701")
+
+    assert dump._hot_mapped_code(catalog, "NQ0000") == "NQ2612"
+    nq = dump._month_codes(catalog, "NQ", as_of)
+    # 價差 NQ2612/2703 與微型 MNQ 都不可以混進來
+    assert [c for c in nq if c != "NQ0000"] == ["NQ2612", "NQ2703", "NQ2706"]
+    assert not [c for c in nq if "/" in c or c.startswith("MNQ")]
+    assert dump._pick_candidates(nq, [None, "NQ2612"]) == ("NQ2612", "NQ2703")
+
+
+# ---- 不登入群益的整支 main()：假的 COM 元件＋假時鐘 ----
+#
+# 為什麼要跑整支 main：上面兩條只證明「零件各自對」，證明不了「價格檔真的長出這兩個鍵」
+# （例如對照表加了但候選、快照、日K 哪一段漏接）。這裡把群益元件換成假的，其餘全照生產碼跑。
+# 🔴 絕不登入群益：CapitalClient、海期報價元件、事件註冊、國內線整段都換掉；
+#    狀態檔與價格檔都寫到 tmp_path，碰不到 data/bfw_settle_state.json。
+
+class _FakeClock:
+    """main 的等待迴圈用 time.time() 判斷逾時；泵一次就把時鐘往前撥，迴圈立刻結束。"""
+
+    def __init__(self):
+        self.now = 1_000_000.0
+
+    def time(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += seconds
+
+
+class _FakeStock:
+    def __init__(self):
+        self.bstrStockNo = ""
+        self.sDecimal = 2
+        self.nClose = self.nRef = self.nSettlePrice = self.nTradingDay = 0
+
+
+class _FakeOSLib:
+    def __init__(self, detail, quotes, klines):
+        self.event = None
+        self._detail, self._quotes, self._klines = detail, quotes, klines
+        self._by_index: list[str] = []
+        self.kline_targets: list[str] = []
+        self.snapshot_targets: list[str] = []
+
+    def SKOSQuoteLib_EnterMonitorLONG(self):  # noqa: N802
+        return 0
+
+    def SKOSQuoteLib_IsConnected(self):  # noqa: N802
+        return 1
+
+    def SKOSQuoteLib_GetOverseaProductDetail(self, _n):  # noqa: N802
+        for line in self._detail:
+            self.event.OnOverseaProductsDetail(line)
+        self.event.OnOverseaProductsDetail("##,,,,,,")
+        return 0
+
+    def SKOSQuoteLib_RequestStocks(self, _page, nos):  # noqa: N802
+        for item in nos.split("#"):
+            self.snapshot_targets.append(item)
+            code = item.split(",")[1]
+            if code in self._quotes:
+                self._by_index.append(code)
+                self.event.OnNotifyQuoteLONG(len(self._by_index) - 1)
+        return 0, 0
+
+    def SKOSQuoteLib_GetStockByIndexLONG(self, index, stock):  # noqa: N802
+        code = self._by_index[index]
+        q = self._quotes[code]
+        stock.bstrStockNo = code
+        stock.nTradingDay = q["day"]
+        stock.nClose = round(q["close"] * 100)
+        stock.nRef = round(q["ref"] * 100)
+        stock.nSettlePrice = round(q["settle"] * 100)
+        return stock, 0
+
+    def SKOSQuoteLib_RequestKLineByDate(self, target, *_a):  # noqa: N802
+        self.kline_targets.append(target)
+        code = target.split(",")[1]
+        for row in self._klines.get(code, _GENERIC_KLINE):
+            self.event.OnKLineData(code, row)
+        return 0
+
+    def SKOSQuoteLib_LeaveMonitor(self):  # noqa: N802
+        return 0
+
+
+class _FakeClient:
+    def __init__(self):
+        self.is_logged_in = False
+
+    def login(self, _user, _password):
+        self.is_logged_in = True
+
+    def logout(self):
+        self.is_logged_in = False
+
+
+def _kline(closes: dict[str, float], volume: int) -> list[str]:
+    return [f"{d.replace('-', '/')}, {c}, {c}, {c}, {c}, {volume}" for d, c in closes.items()]
+
+
+_GENERIC_KLINE = _kline({f"2026-11-{d:02d}": 100.0 + d / 10
+                         for d in (12, 13, 16, 17, 18, 19, 20, 23, 24)}, 10)
+# 新商品的近月：成交量 1000 遠大於次月的 10 ⇒ 不會被量判滾月；收盤刻意給好算的整數
+SM_LAST_TRADE = {"2026-11-12": 298.0, "2026-11-13": 299.0, "2026-11-16": 300.0,
+                 "2026-11-17": 301.0, "2026-11-18": 302.0, "2026-11-19": 303.0,
+                 "2026-11-20": 305.0, "2026-11-23": 309.0, "2026-11-24": 313.0}
+NQ_LAST_TRADE = {"2026-11-12": 20500.0, "2026-11-13": 20550.0, "2026-11-16": 20600.0,
+                 "2026-11-17": 20650.0, "2026-11-18": 20700.0, "2026-11-19": 20750.0,
+                 "2026-11-20": 20790.0, "2026-11-23": 20990.0, "2026-11-24": 21050.0}
+
+
+def _fake_world(trading_day: int, new_quotes: dict[str, dict]):
+    """其他商品照現行對照表自動生成；新商品用 11-18 的原文列與指定的快照。"""
+    detail = list(CAPTURE_1118_DETAIL)
+    have = {line.split(",")[2] for line in detail}
+    for key, (exch, hot) in dump.FUTURES_HOT.items():
+        if hot in have:
+            continue
+        root = hot[:-4]
+        detail += [f"{exch},x,{hot},{key},{exch},{root}_202612,20261214,20261130,2",
+                   f"{exch},x,{root}2612,{key},{exch},{root}_202612,20261214,20261130,2",
+                   f"{exch},x,{root}2703,{key},{exch},{root}_202703,20270312,20270226,2"]
+    for key, (exch, root) in dump.SETTLE_CHAIN.items():
+        detail += [f"{exch},x,{root}2612,{key},{exch},{root}_202612,20261214,20261130,2",
+                   f"{exch},x,{root}2703,{key},{exch},{root}_202703,20270312,20270226,2"]
+    for key, (exch, code) in {**dump.SPOT, **dump.SPOT_INDEX}.items():
+        detail.append(f"{exch},x,{code},{key},{exch},{code},99991231,0,4")
+    # main 在商品檔不滿 500 筆時直接中止（防殘缺商品檔）⇒ 補幾百筆無關商品
+    detail += [f"ZZZ,x,ZZ{i:04d},filler,ZZZ,ZZ_{i},20271231,20271231,2" for i in range(520)]
+
+    generic = {"day": trading_day, "close": 100.0, "ref": 99.0, "settle": 100.0}
+    quotes = {line.split(",")[2]: dict(generic) for line in detail
+              if not line.startswith("ZZZ")}
+    quotes.update(new_quotes)
+    klines = {"SM2612": _kline(SM_LAST_TRADE, 1000), "NQ2612": _kline(NQ_LAST_TRADE, 1000)}
+    return _FakeOSLib(detail, quotes, klines)
+
+
+def _run_main(monkeypatch, tmp_path, as_of: str, os_lib) -> dict:
+    clock = _FakeClock()
+    calls = {"domestic": 0}
+
+    def _no_domestic(*_a, **_k):
+        calls["domestic"] += 1
+
+    monkeypatch.setattr(dump, "time", clock)
+    monkeypatch.setattr(dump, "_make_pump", lambda: clock.sleep)
+    monkeypatch.setattr(dump, "CapitalClient", _FakeClient)
+    monkeypatch.setattr(dump, "create_os_quote_lib", lambda: os_lib)
+    monkeypatch.setattr(dump, "get_sk_module", lambda: SimpleNamespace(SKFOREIGNLONG=_FakeStock))
+    monkeypatch.setattr(dump, "comtypes", SimpleNamespace(client=SimpleNamespace(
+        GetEvents=lambda lib, ev: setattr(lib, "event", ev))))
+    monkeypatch.setattr(dump, "_run_domestic", _no_domestic)
+    monkeypatch.setattr(dump, "STATE_PATH", tmp_path / "bfw_settle_state.json")
+    monkeypatch.setenv("CAPITAL_USER_ID", "fake-user")
+    monkeypatch.setenv("CAPITAL_PASSWORD", "fake-password")
+    out = tmp_path / f"prices_{as_of}.json"
+    monkeypatch.setattr(sys, "argv", ["dump_bfw_price_changes.py", "--date", as_of,
+                                      "--out", str(out)])
+    assert dump.main() == 0
+    assert calls["domestic"] == 1          # 國內線那段確實被換掉、沒有真的登入
+    return json.loads(out.read_text(encoding="utf-8"))["prices"]
+
+
+def _snap(day: int, settle: float, ref: float) -> dict:
+    return {"day": day, "close": settle, "ref": ref, "settle": settle}
+
+
+def test_price_file_gets_both_new_keys_on_the_first_day(monkeypatch, tmp_path):
+    """第一天（鏈上沒有昨結）：06:30 時點 nRef 是真昨結 ⇒ 日漲跌照結算鏈出值，週漲跌用最後成交過渡。"""
+    world = _fake_world(20261123, {
+        "SM2612": _snap(20261123, settle=310.5, ref=305.0),
+        "SM2701": _snap(20261123, settle=312.0, ref=306.0),
+        "NQ2612": _snap(20261123, settle=21000.0, ref=20790.0),
+        "NQ2703": _snap(20261123, settle=21200.0, ref=20990.0),
+    })
+    prices = _run_main(monkeypatch, tmp_path, "2026-11-24", world)
+
+    expected_keys = (set(dump.FUTURES_HOT) | set(dump.SETTLE_CHAIN)
+                     | set(dump.SPOT) | set(dump.SPOT_INDEX))
+    assert set(prices) == expected_keys
+    assert {"soybean_meal", "nasdaq100"} <= set(prices)
+
+    sm = prices["soybean_meal"]
+    assert sm["series"] == "CBOT,SM2612"
+    assert sm["daily_pct"] == 1.8033            # 310.5 / 305.0 - 1
+    assert sm["weekly_pct"] == 3.0              # 最後成交 309 / 300（11-23 對 11-16）
+    assert sm["last_date"] == "2026-11-23"
+    assert "日=結算鏈" in sm["resolve"] and "最後成交鏈(過渡)" in sm["resolve"]
+
+    nq = prices["nasdaq100"]
+    assert nq["series"] == "CME,NQ2612"
+    assert nq["daily_pct"] == 1.0101            # 21000 / 20790 - 1
+    assert nq["weekly_pct"] == 1.8932           # 最後成交 20990 / 20600
+    assert nq["last_date"] == "2026-11-23"
+
+    # 快照與日K 抓的是具體合約（近月＋次月），🔴 絕不抓 HOT 本身（HOT 日K 是換月拼接序列）
+    for target in ("CBOT,SM2612", "CBOT,SM2701", "CME,NQ2612", "CME,NQ2703"):
+        assert target in world.snapshot_targets and target in world.kline_targets
+    for hot in ("CBOT,SM0000", "CME,NQ0000"):
+        assert hot not in world.snapshot_targets and hot not in world.kline_targets
+
+    # 近月與次月兩條鏈都種下第一格，隔天才接得上
+    state = json.loads((tmp_path / "bfw_settle_state.json").read_text(encoding="utf-8"))
+    assert state["soybean_meal"]["active_code"] == "SM2612"
+    assert state["soybean_meal"]["chains"]["SM2612"]["history"] == {"2026-11-23": 310.5}
+    assert state["soybean_meal"]["chains"]["SM2701"]["history"] == {"2026-11-23": 312.0}
+    assert state["nasdaq100"]["chains"]["NQ2612"]["history"] == {"2026-11-23": 21000.0}
+
+
+def test_first_day_with_rewritten_nref_falls_back_to_last_trade(monkeypatch, tmp_path):
+    """第一天、nRef 已被改寫成當日結算（ref == settle 簽名）⇒ 不出假的 0.00%，改用同合約最後成交。"""
+    world = _fake_world(20261123, {
+        "SM2612": _snap(20261123, settle=310.5, ref=310.5),
+        "NQ2612": _snap(20261123, settle=21000.0, ref=21000.0),
+    })
+    prices = _run_main(monkeypatch, tmp_path, "2026-11-24", world)
+
+    sm = prices["soybean_meal"]
+    assert sm["daily_pct"] == 1.3115            # 最後成交 309 / 305（11-23 對 11-20）
+    assert sm["weekly_pct"] == 3.0
+    assert "本日用同合約最後成交鏈" in sm["resolve"]
+    nq = prices["nasdaq100"]
+    assert nq["daily_pct"] == 0.962             # 最後成交 20990 / 20790
+    assert "本日用同合約最後成交鏈" in nq["resolve"]
+
+
+def test_second_day_uses_the_settlement_chain(monkeypatch, tmp_path):
+    """第二天：昨結取自第一天存下的鏈，而不是當天快照的 nRef。"""
+    _run_main(monkeypatch, tmp_path, "2026-11-24", _fake_world(20261123, {
+        "SM2612": _snap(20261123, settle=310.5, ref=305.0),
+        "NQ2612": _snap(20261123, settle=21000.0, ref=20790.0),
+    }))
+    # nRef 故意給一個跟鏈上不同的值：用鏈的話是 314/310.5，用 nRef 的話是 314/311
+    prices = _run_main(monkeypatch, tmp_path, "2026-11-25", _fake_world(20261124, {
+        "SM2612": _snap(20261124, settle=314.0, ref=311.0),
+        "NQ2612": _snap(20261124, settle=21105.0, ref=21000.0),
+    }))
+
+    sm = prices["soybean_meal"]
+    assert sm["daily_pct"] == 1.1272            # 314 / 310.5 - 1
+    assert sm["last_date"] == "2026-11-24"
+    assert "日=結算鏈" in sm["resolve"]
+    nq = prices["nasdaq100"]
+    assert nq["daily_pct"] == 0.5               # 21105 / 21000 - 1
